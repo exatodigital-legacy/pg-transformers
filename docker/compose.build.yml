@@ -1,0 +1,6 @@
+# Override: build the image from source (docker/Dockerfile) instead of
+# pulling from GHCR. Compiling plv8 takes a while.
+#   docker compose -f docker/compose.yml -f docker/compose.build.yml up -d --build
+services:
+  db:
+    build: .

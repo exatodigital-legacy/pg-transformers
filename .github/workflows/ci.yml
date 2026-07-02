@@ -37,9 +37,8 @@ jobs:
         # source if it isn't available (first run, or after a version bump)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker compose -f docker/compose.yml pull db || true
-          docker compose -f docker/compose.yml up -d --wait --no-build \
-            || docker compose -f docker/compose.yml up -d --wait --build
+          docker compose -f docker/compose.yml up -d --wait \
+            || docker compose -f docker/compose.yml -f docker/compose.build.yml up -d --wait --build
       - name: build, export, load
         run: |
           kernel/build.sh all-minilm
