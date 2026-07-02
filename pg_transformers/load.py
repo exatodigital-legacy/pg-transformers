@@ -18,6 +18,8 @@ def load(key, dsn=None, skip_weights=False):
     art = registry.artifacts_dir()
     meta = json.load(open(os.path.join(art, f"{key}_meta.json")))
     wasm = open(os.path.join(art, f"{key}.wasm"), "rb").read()
+    relaxed_path = os.path.join(art, f"{key}.relaxed.wasm")
+    wasm_relaxed = open(relaxed_path, "rb").read() if os.path.exists(relaxed_path) else None
 
     conn = psycopg.connect(dsn or registry.default_dsn(), autocommit=True)
     cur = conn.cursor()
@@ -25,7 +27,8 @@ def load(key, dsn=None, skip_weights=False):
 
     cur.execute("delete from pgt_model where key=%s", (key,))
     cur.execute("delete from pgt_vocab where key=%s", (key,))
-    cur.execute("insert into pgt_model values (%s,%s,%s)", (key, wasm, json.dumps(meta)))
+    cur.execute("insert into pgt_model values (%s,%s,%s,%s)",
+                (key, wasm, json.dumps(meta), wasm_relaxed))
 
     if not skip_weights:
         cur.execute("delete from pgt_rest where key=%s", (key,))

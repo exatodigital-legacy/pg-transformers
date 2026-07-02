@@ -35,7 +35,24 @@ CREATE OR REPLACE FUNCTION pgt_probe() RETURNS text LANGUAGE plv8 AS $js$
     line(true, 'wasm SIMD (v128)');
   } catch (e) { line(false, 'wasm SIMD (v128)', '' + e); }
 
-  // 4. memory headroom (bge-m3 needs ~2.3GB in-wasm, int8 variant ~0.6GB;
+  // 4. relaxed SIMD (optional: FMA + int8 dot products, V8 11.4+, e.g.
+  //    plv8 3.2.x). pg-transformers falls back to baseline SIMD without it,
+  //    at lower throughput.
+  try {
+    var relaxed = new Uint8Array([0,97,115,109,1,0,0,0, 1,4,1,96,0,0, 3,2,1,0,
+      10,62,1,60,0,
+      253,12,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      253,12,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      253,12,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+      253,133,2, 26, 11]);
+    var rOk = false;
+    try { rOk = WebAssembly.validate(relaxed); } catch (e) {}
+    line(true, 'wasm relaxed SIMD (optional)',
+         rOk ? 'available (FMA + int8 dot kernels)'
+             : 'not available; baseline SIMD kernels used');
+  } catch (e) { line(true, 'wasm relaxed SIMD (optional)', 'not available: ' + e); }
+
+  // 5. memory headroom (bge-m3 needs ~2.3GB in-wasm, int8 variant ~0.6GB;
   //    serafim ~0.45GB / 0.11GB; minilm ~0.1GB / 0.03GB)
   var mb = 0;
   try {
@@ -48,7 +65,7 @@ CREATE OR REPLACE FUNCTION pgt_probe() RETURNS text LANGUAGE plv8 AS $js$
   line(mb >= 128, 'wasm memory', mb + 'MB allocatable' +
        (mb >= 2560 ? ' (all models incl. bge-m3)' : mb >= 512 ? ' (small/medium models)' : ''));
 
-  // 5. how bytea arrives from SQL (informational; the loader accepts both)
+  // 6. how bytea arrives from SQL (informational; the loader accepts both)
   try {
     var r = plv8.execute("select '\\x0102'::bytea as b")[0].b;
     line(true, 'bytea to JS', Object.prototype.toString.call(r));

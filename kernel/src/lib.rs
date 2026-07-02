@@ -64,6 +64,35 @@ static mut FFN1: [f32; MAXN * I] = [0.0; MAXN * I];
 static mut SCORES: [f32; MAXN] = [0.0; MAXN];
 static mut OUT: [f32; H] = [0.0; H];
 
+// int8 builds quantize the input rows of every linear to asymmetric u8
+// scratch (x ~ scale*xq + xmin) with one scale/min per BQ-column block per
+// token - per-token ranges are inflated by transformer outlier channels
+// (visible as a cosine drop on the 24-layer bge-m3), per-block ranges are
+// not. The GEMM then runs in the integer domain: i32x4.dot_i16x8_s on
+// baseline SIMD, or the relaxed i8 dot (SDOT/VNNI) with +relaxed-simd. The
+// relaxed instruction only guarantees portable results when its second
+// operand is 7-bit, so that path splits each u8 activation as
+// a = 2*(a>>1) + (a&1) and chains three dots (hi, hi, lo) - exact u8
+// reconstruction, both halves in [0,127].
+const QIN: usize = if QUANT_INT8 { if I > H { I } else { H } } else { 0 };
+const BQ: usize = 128; // every H and I is a multiple of this
+const MAXNB: usize = QIN / BQ;
+const NASC: usize = if QUANT_INT8 { MAXN * MAXNB } else { 0 };
+// one weight-row sum per BQ-block per linear output row, in QW layout
+// order; filled by prep() after the weights stream in, used to fold the
+// activation offset back in per block:
+// sum_i(w*x) = sum_b(ascale_b*dot(wq_b,xq_b) + xmin_b*rowsum_b)
+const NROWS: usize = if QUANT_INT8 {
+    L * (4 * H * (H / BQ) + I * (H / BQ) + H * (I / BQ))
+} else { 0 };
+const QMAXF: f32 = 255.0;
+#[repr(align(16))]
+struct XqAligned([u8; MAXN * QIN]);
+static mut XQ: XqAligned = XqAligned([0; MAXN * QIN]);
+static mut ASCALE: [f32; NASC] = [0.0; NASC];
+static mut AMIN: [f32; NASC] = [0.0; NASC];
+static mut RSUM: [f32; NROWS] = [0.0; NROWS];
+
 #[no_mangle]
 pub extern "C" fn rest_ptr() -> *mut f32 { unsafe { W.as_mut_ptr() } }
 #[no_mangle]
@@ -84,6 +113,43 @@ pub extern "C" fn out_ptr() -> *const f32 { unsafe { OUT.as_ptr() } }
 pub extern "C" fn max_tokens() -> i32 { MAXN as i32 }
 #[no_mangle]
 pub extern "C" fn hidden() -> i32 { H as i32 }
+
+/// sum each BQ-block of each int8 weight row into RSUM (exact small ints)
+unsafe fn sum_rows(w_off: usize, r_off: usize, rows: usize, din: usize) {
+    let nb = din / BQ;
+    for j in 0..rows {
+        let wj = QW.0.as_ptr().add(w_off + j * din);
+        for b in 0..nb {
+            let mut acc = i32x4_splat(0);
+            let mut i = b * BQ;
+            while i < (b + 1) * BQ {
+                acc = i32x4_add(acc, i32x4_extadd_pairwise_i16x8(
+                    i16x8_extadd_pairwise_i8x16(v128_load(wj.add(i) as *const v128))));
+                i += 16;
+            }
+            *RSUM.as_mut_ptr().add(r_off + j * nb + b) = hsum_i32(acc) as f32;
+        }
+    }
+}
+
+/// int8 builds: precompute per-row per-block weight sums (one pass over
+/// QW). The JS loader calls this once after the weights finish streaming.
+#[no_mangle]
+pub extern "C" fn prep() {
+    if !QUANT_INT8 { return; }
+    unsafe {
+        let mut cq = Cur(0);
+        let mut cr = Cur(0);
+        for _l in 0..L {
+            sum_rows(cq.take(H * H), cr.take(H * (H / BQ)), H, H);
+            sum_rows(cq.take(H * H), cr.take(H * (H / BQ)), H, H);
+            sum_rows(cq.take(H * H), cr.take(H * (H / BQ)), H, H);
+            sum_rows(cq.take(H * H), cr.take(H * (H / BQ)), H, H);
+            sum_rows(cq.take(I * H), cr.take(I * (H / BQ)), I, H);
+            sum_rows(cq.take(H * I), cr.take(H * (I / BQ)), H, I);
+        }
+    }
+}
 
 #[inline(always)]
 unsafe fn hsum(v: v128) -> f32 {
@@ -180,115 +246,273 @@ unsafe fn linear(x: *const f32, w_off: usize, b_off: usize, y: *mut f32,
     }
 }
 
-/// widen 16 int8 weights (one v128 load) to 4 f32x4 vectors
 #[inline(always)]
-unsafe fn dequant16(wq: v128) -> (v128, v128, v128, v128) {
-    let lo = i16x8_extend_low_i8x16(wq);
-    let hi = i16x8_extend_high_i8x16(wq);
-    (f32x4_convert_i32x4(i32x4_extend_low_i16x8(lo)),
-     f32x4_convert_i32x4(i32x4_extend_high_i16x8(lo)),
-     f32x4_convert_i32x4(i32x4_extend_low_i16x8(hi)),
-     f32x4_convert_i32x4(i32x4_extend_high_i16x8(hi)))
+unsafe fn hsum_i32(v: v128) -> i32 {
+    i32x4_extract_lane::<0>(v) + i32x4_extract_lane::<1>(v)
+        + i32x4_extract_lane::<2>(v) + i32x4_extract_lane::<3>(v)
 }
 
-/// int8-weight dot product against f32 activations; k is a multiple of 16.
-/// The caller applies the row scale to the result.
-#[inline]
-unsafe fn dot_q8(a: *const f32, w: *const i8, k: usize) -> f32 {
-    let mut acc0 = f32x4_splat(0.0);
-    let mut acc1 = f32x4_splat(0.0);
-    let mut acc2 = f32x4_splat(0.0);
-    let mut acc3 = f32x4_splat(0.0);
-    let mut i = 0;
-    while i < k {
-        let (w0, w1, w2, w3) = dequant16(v128_load(w.add(i) as *const v128));
-        acc0 = madd(w0, v128_load(a.add(i) as *const v128), acc0);
-        acc1 = madd(w1, v128_load(a.add(i + 4) as *const v128), acc1);
-        acc2 = madd(w2, v128_load(a.add(i + 8) as *const v128), acc2);
-        acc3 = madd(w3, v128_load(a.add(i + 12) as *const v128), acc3);
-        i += 16;
+/// Quantize n rows of k f32 (k a multiple of BQ) to asymmetric u8 in XQ,
+/// one scale/min per BQ-column block: xq = round((x - xmin_b) * QMAXF /
+/// (xmax_b - xmin_b)), so x ~ ASCALE[t*nb+b]*xq + AMIN[t*nb+b].
+/// round-to-nearest-even, saturating narrow.
+unsafe fn quant_rows(x: *const f32, n: usize, k: usize) {
+    let nb = k / BQ;
+    for t in 0..n {
+        for b in 0..nb {
+            let xr = x.add(t * k + b * BQ);
+            let mut mn = v128_load(xr as *const v128);
+            let mut mx = mn;
+            let mut i = 4;
+            while i < BQ {
+                let v = v128_load(xr.add(i) as *const v128);
+                mn = f32x4_pmin(mn, v);
+                mx = f32x4_pmax(mx, v);
+                i += 4;
+            }
+            let xmin = f32x4_extract_lane::<0>(mn)
+                .min(f32x4_extract_lane::<1>(mn))
+                .min(f32x4_extract_lane::<2>(mn))
+                .min(f32x4_extract_lane::<3>(mn));
+            let xmax = f32x4_extract_lane::<0>(mx)
+                .max(f32x4_extract_lane::<1>(mx))
+                .max(f32x4_extract_lane::<2>(mx))
+                .max(f32x4_extract_lane::<3>(mx));
+            let range = xmax - xmin;
+            let (scale, inv) =
+                if range > 0.0 { (range / QMAXF, QMAXF / range) } else { (1.0, 0.0) };
+            *ASCALE.as_mut_ptr().add(t * nb + b) = scale;
+            *AMIN.as_mut_ptr().add(t * nb + b) = xmin;
+            let iv = f32x4_splat(inv);
+            let mv = f32x4_splat(xmin);
+            let out = XQ.0.as_mut_ptr().add(t * k + b * BQ);
+            let mut i = 0;
+            while i < BQ {
+                let q = |o: usize| i32x4_trunc_sat_f32x4(f32x4_nearest(f32x4_mul(
+                    f32x4_sub(v128_load(xr.add(i + o) as *const v128), mv), iv)));
+                let lo = i16x8_narrow_i32x4(q(0), q(4));
+                let hi = i16x8_narrow_i32x4(q(8), q(12));
+                v128_store(out.add(i) as *mut v128, u8x16_narrow_i16x8(lo, hi));
+                i += 16;
+            }
+        }
     }
-    hsum(f32x4_add(f32x4_add(acc0, acc1), f32x4_add(acc2, acc3)))
 }
 
-/// weight-only int8 linear: weight rows live in QW as int8, W holds one f32
-/// scale per output row (s_off) and the bias (b_off). Register-blocks 2
-/// output rows x 4 tokens: each dequantized weight vector is reused across
-/// 4 tokens and each activation load across 2 rows, so the loop does ~0.6
-/// loads per madd where the fp32 kernel does 1.25 - this path is bound by
-/// load-port throughput, not compute. Each (row,token) pair accumulates in
-/// its own single chain, in weight order, regardless of the blocking.
-unsafe fn linear_q8(x: *const f32, w_off: usize, s_off: usize, b_off: usize,
+/// one BQ-block of the u8-activation x int8-weight dot product, in the
+/// integer domain. The caller applies the block scale and offset.
+#[inline]
+unsafe fn dot_q8_blk(a: *const u8, w: *const i8) -> i32 {
+    #[cfg(target_feature = "relaxed-simd")]
+    {
+        let one = u8x16_splat(1);
+        let mut acc = i32x4_splat(0);
+        let mut i = 0;
+        while i < BQ {
+            let wv = v128_load(w.add(i) as *const v128);
+            let av = v128_load(a.add(i) as *const v128);
+            let ahi = u8x16_shr(av, 1);
+            let alo = v128_and(av, one);
+            acc = i32x4_relaxed_dot_i8x16_i7x16_add(wv, ahi, acc);
+            acc = i32x4_relaxed_dot_i8x16_i7x16_add(wv, ahi, acc);
+            acc = i32x4_relaxed_dot_i8x16_i7x16_add(wv, alo, acc);
+            i += 16;
+        }
+        hsum_i32(acc)
+    }
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    {
+        let mut acc0 = i32x4_splat(0);
+        let mut acc1 = i32x4_splat(0);
+        let mut i = 0;
+        while i < BQ {
+            let av = v128_load(a.add(i) as *const v128);
+            let wv = v128_load(w.add(i) as *const v128);
+            acc0 = i32x4_add(acc0, i32x4_dot_i16x8(
+                u16x8_extend_low_u8x16(av), i16x8_extend_low_i8x16(wv)));
+            acc1 = i32x4_add(acc1, i32x4_dot_i16x8(
+                u16x8_extend_high_u8x16(av), i16x8_extend_high_i8x16(wv)));
+            i += 16;
+        }
+        hsum_i32(i32x4_add(acc0, acc1))
+    }
+}
+
+/// full-row dot for the tail paths: sum over blocks of
+/// ascale_b*dot(wq_b,xq_b) + xmin_b*rowsum_b
+#[inline]
+unsafe fn dot_q8(a: *const u8, w: *const i8, cs: *const f32, cm: *const f32,
+                 rs: *const f32, nb: usize) -> f32 {
+    let mut y = 0.0f32;
+    for b in 0..nb {
+        y += *cs.add(b) * dot_q8_blk(a.add(b * BQ), w.add(b * BQ)) as f32
+            + *cm.add(b) * *rs.add(b);
+    }
+    y
+}
+
+/// weight-only int8 linear over per-token per-block u8 activations (call
+/// quant_rows on the f32 input first; reads XQ/ASCALE/AMIN). Weight rows
+/// live in QW as int8, W holds one f32 scale per output row (s_off) and the
+/// bias (b_off); RSUM (from rs_off, filled by prep) folds the activation
+/// offsets back in: y = b + wscale * sum_b(ascale_b*dot(wq_b,xq_b) +
+/// xmin_b*rowsum_b). Each block's integer dot runs in the integer domain -
+/// i32x4.dot_i16x8_s on baseline SIMD, the relaxed i8 dot (SDOT/VNNI, 16
+/// madds per instruction) with +relaxed-simd - and is folded into f32x4
+/// accumulators with one convert+madd per block. Register-blocks 2 output
+/// rows x 4 tokens as in linear(). Integer accumulation is associative and
+/// the f32 fold happens once per block in block order, so results do not
+/// depend on the register blocking.
+unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
                     y: *mut f32, n: usize, din: usize, dout: usize) {
+    let nb = din / BQ;
+    let xq = XQ.0.as_ptr();
+    let asc = ASCALE.as_ptr();
+    let amn = AMIN.as_ptr();
     let wp = QW.0.as_ptr().add(w_off);
+    let rp = RSUM.as_ptr().add(rs_off);
     let sp = W.as_ptr().add(s_off);
     let bp = W.as_ptr().add(b_off);
+    // xmin_b * rowsum_b summed over blocks, one token row against one
+    // weight row: a tiny nb-long dot product
+    #[inline(always)]
+    unsafe fn mincorr(cm: *const f32, rs: *const f32, nb: usize) -> f32 {
+        let mut s = 0.0f32;
+        for b in 0..nb { s += *cm.add(b) * *rs.add(b); }
+        s
+    }
     let mut j = 0;
     while j + 2 <= dout {
         let wj0 = wp.add(j * din);
         let wj1 = wp.add((j + 1) * din);
         let (sj0, sj1) = (*sp.add(j), *sp.add(j + 1));
         let (bj0, bj1) = (*bp.add(j), *bp.add(j + 1));
+        let (rj0, rj1) = (rp.add(j * nb), rp.add((j + 1) * nb));
         let mut t = 0;
         while t + 4 <= n {
-            let (x0, x1, x2, x3) = (x.add(t * din), x.add((t + 1) * din),
-                                    x.add((t + 2) * din), x.add((t + 3) * din));
-            let mut a00 = f32x4_splat(0.0); let mut a01 = f32x4_splat(0.0);
-            let mut a10 = f32x4_splat(0.0); let mut a11 = f32x4_splat(0.0);
-            let mut a20 = f32x4_splat(0.0); let mut a21 = f32x4_splat(0.0);
-            let mut a30 = f32x4_splat(0.0); let mut a31 = f32x4_splat(0.0);
-            let mut i = 0;
-            while i < din {
-                let (p0, p1, p2, p3) = dequant16(v128_load(wj0.add(i) as *const v128));
-                let (q0, q1, q2, q3) = dequant16(v128_load(wj1.add(i) as *const v128));
-                let mut xv;
-                xv = v128_load(x0.add(i) as *const v128);
-                a00 = madd(p0, xv, a00); a01 = madd(q0, xv, a01);
-                xv = v128_load(x1.add(i) as *const v128);
-                a10 = madd(p0, xv, a10); a11 = madd(q0, xv, a11);
-                xv = v128_load(x2.add(i) as *const v128);
-                a20 = madd(p0, xv, a20); a21 = madd(q0, xv, a21);
-                xv = v128_load(x3.add(i) as *const v128);
-                a30 = madd(p0, xv, a30); a31 = madd(q0, xv, a31);
-                xv = v128_load(x0.add(i + 4) as *const v128);
-                a00 = madd(p1, xv, a00); a01 = madd(q1, xv, a01);
-                xv = v128_load(x1.add(i + 4) as *const v128);
-                a10 = madd(p1, xv, a10); a11 = madd(q1, xv, a11);
-                xv = v128_load(x2.add(i + 4) as *const v128);
-                a20 = madd(p1, xv, a20); a21 = madd(q1, xv, a21);
-                xv = v128_load(x3.add(i + 4) as *const v128);
-                a30 = madd(p1, xv, a30); a31 = madd(q1, xv, a31);
-                xv = v128_load(x0.add(i + 8) as *const v128);
-                a00 = madd(p2, xv, a00); a01 = madd(q2, xv, a01);
-                xv = v128_load(x1.add(i + 8) as *const v128);
-                a10 = madd(p2, xv, a10); a11 = madd(q2, xv, a11);
-                xv = v128_load(x2.add(i + 8) as *const v128);
-                a20 = madd(p2, xv, a20); a21 = madd(q2, xv, a21);
-                xv = v128_load(x3.add(i + 8) as *const v128);
-                a30 = madd(p2, xv, a30); a31 = madd(q2, xv, a31);
-                xv = v128_load(x0.add(i + 12) as *const v128);
-                a00 = madd(p3, xv, a00); a01 = madd(q3, xv, a01);
-                xv = v128_load(x1.add(i + 12) as *const v128);
-                a10 = madd(p3, xv, a10); a11 = madd(q3, xv, a11);
-                xv = v128_load(x2.add(i + 12) as *const v128);
-                a20 = madd(p3, xv, a20); a21 = madd(q3, xv, a21);
-                xv = v128_load(x3.add(i + 12) as *const v128);
-                a30 = madd(p3, xv, a30); a31 = madd(q3, xv, a31);
-                i += 16;
+            let (x0, x1, x2, x3) = (xq.add(t * din), xq.add((t + 1) * din),
+                                    xq.add((t + 2) * din), xq.add((t + 3) * din));
+            let mut y00 = f32x4_splat(0.0); let mut y01 = f32x4_splat(0.0);
+            let mut y10 = f32x4_splat(0.0); let mut y11 = f32x4_splat(0.0);
+            let mut y20 = f32x4_splat(0.0); let mut y21 = f32x4_splat(0.0);
+            let mut y30 = f32x4_splat(0.0); let mut y31 = f32x4_splat(0.0);
+            for b in 0..nb {
+                let mut a00 = i32x4_splat(0); let mut a01 = i32x4_splat(0);
+                let mut a10 = i32x4_splat(0); let mut a11 = i32x4_splat(0);
+                let mut a20 = i32x4_splat(0); let mut a21 = i32x4_splat(0);
+                let mut a30 = i32x4_splat(0); let mut a31 = i32x4_splat(0);
+                let mut i = b * BQ;
+                while i < (b + 1) * BQ {
+                    let w0v = v128_load(wj0.add(i) as *const v128);
+                    let w1v = v128_load(wj1.add(i) as *const v128);
+                    #[cfg(target_feature = "relaxed-simd")]
+                    {
+                        let one = u8x16_splat(1);
+                        let mut av; let mut ahi; let mut alo;
+                        av = v128_load(x0.add(i) as *const v128);
+                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
+                        a00 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a00);
+                        a00 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a00);
+                        a00 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a00);
+                        a01 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a01);
+                        a01 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a01);
+                        a01 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a01);
+                        av = v128_load(x1.add(i) as *const v128);
+                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
+                        a10 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a10);
+                        a10 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a10);
+                        a10 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a10);
+                        a11 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a11);
+                        a11 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a11);
+                        a11 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a11);
+                        av = v128_load(x2.add(i) as *const v128);
+                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
+                        a20 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a20);
+                        a20 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a20);
+                        a20 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a20);
+                        a21 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a21);
+                        a21 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a21);
+                        a21 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a21);
+                        av = v128_load(x3.add(i) as *const v128);
+                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
+                        a30 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a30);
+                        a30 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a30);
+                        a30 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a30);
+                        a31 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a31);
+                        a31 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a31);
+                        a31 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a31);
+                    }
+                    #[cfg(not(target_feature = "relaxed-simd"))]
+                    {
+                        let w0l = i16x8_extend_low_i8x16(w0v);
+                        let w0h = i16x8_extend_high_i8x16(w0v);
+                        let w1l = i16x8_extend_low_i8x16(w1v);
+                        let w1h = i16x8_extend_high_i8x16(w1v);
+                        let mut av; let mut al; let mut ah;
+                        av = v128_load(x0.add(i) as *const v128);
+                        al = u16x8_extend_low_u8x16(av); ah = u16x8_extend_high_u8x16(av);
+                        a00 = i32x4_add(a00, i32x4_dot_i16x8(al, w0l));
+                        a00 = i32x4_add(a00, i32x4_dot_i16x8(ah, w0h));
+                        a01 = i32x4_add(a01, i32x4_dot_i16x8(al, w1l));
+                        a01 = i32x4_add(a01, i32x4_dot_i16x8(ah, w1h));
+                        av = v128_load(x1.add(i) as *const v128);
+                        al = u16x8_extend_low_u8x16(av); ah = u16x8_extend_high_u8x16(av);
+                        a10 = i32x4_add(a10, i32x4_dot_i16x8(al, w0l));
+                        a10 = i32x4_add(a10, i32x4_dot_i16x8(ah, w0h));
+                        a11 = i32x4_add(a11, i32x4_dot_i16x8(al, w1l));
+                        a11 = i32x4_add(a11, i32x4_dot_i16x8(ah, w1h));
+                        av = v128_load(x2.add(i) as *const v128);
+                        al = u16x8_extend_low_u8x16(av); ah = u16x8_extend_high_u8x16(av);
+                        a20 = i32x4_add(a20, i32x4_dot_i16x8(al, w0l));
+                        a20 = i32x4_add(a20, i32x4_dot_i16x8(ah, w0h));
+                        a21 = i32x4_add(a21, i32x4_dot_i16x8(al, w1l));
+                        a21 = i32x4_add(a21, i32x4_dot_i16x8(ah, w1h));
+                        av = v128_load(x3.add(i) as *const v128);
+                        al = u16x8_extend_low_u8x16(av); ah = u16x8_extend_high_u8x16(av);
+                        a30 = i32x4_add(a30, i32x4_dot_i16x8(al, w0l));
+                        a30 = i32x4_add(a30, i32x4_dot_i16x8(ah, w0h));
+                        a31 = i32x4_add(a31, i32x4_dot_i16x8(al, w1l));
+                        a31 = i32x4_add(a31, i32x4_dot_i16x8(ah, w1h));
+                    }
+                    i += 16;
+                }
+                let cs0 = f32x4_splat(*asc.add(t * nb + b));
+                let cs1 = f32x4_splat(*asc.add((t + 1) * nb + b));
+                let cs2 = f32x4_splat(*asc.add((t + 2) * nb + b));
+                let cs3 = f32x4_splat(*asc.add((t + 3) * nb + b));
+                y00 = madd(f32x4_convert_i32x4(a00), cs0, y00);
+                y01 = madd(f32x4_convert_i32x4(a01), cs0, y01);
+                y10 = madd(f32x4_convert_i32x4(a10), cs1, y10);
+                y11 = madd(f32x4_convert_i32x4(a11), cs1, y11);
+                y20 = madd(f32x4_convert_i32x4(a20), cs2, y20);
+                y21 = madd(f32x4_convert_i32x4(a21), cs2, y21);
+                y30 = madd(f32x4_convert_i32x4(a30), cs3, y30);
+                y31 = madd(f32x4_convert_i32x4(a31), cs3, y31);
             }
-            *y.add(t * dout + j) = bj0 + sj0 * hsum(a00);
-            *y.add(t * dout + j + 1) = bj1 + sj1 * hsum(a01);
-            *y.add((t + 1) * dout + j) = bj0 + sj0 * hsum(a10);
-            *y.add((t + 1) * dout + j + 1) = bj1 + sj1 * hsum(a11);
-            *y.add((t + 2) * dout + j) = bj0 + sj0 * hsum(a20);
-            *y.add((t + 2) * dout + j + 1) = bj1 + sj1 * hsum(a21);
-            *y.add((t + 3) * dout + j) = bj0 + sj0 * hsum(a30);
-            *y.add((t + 3) * dout + j + 1) = bj1 + sj1 * hsum(a31);
+            *y.add(t * dout + j) =
+                bj0 + sj0 * (hsum(y00) + mincorr(amn.add(t * nb), rj0, nb));
+            *y.add(t * dout + j + 1) =
+                bj1 + sj1 * (hsum(y01) + mincorr(amn.add(t * nb), rj1, nb));
+            *y.add((t + 1) * dout + j) =
+                bj0 + sj0 * (hsum(y10) + mincorr(amn.add((t + 1) * nb), rj0, nb));
+            *y.add((t + 1) * dout + j + 1) =
+                bj1 + sj1 * (hsum(y11) + mincorr(amn.add((t + 1) * nb), rj1, nb));
+            *y.add((t + 2) * dout + j) =
+                bj0 + sj0 * (hsum(y20) + mincorr(amn.add((t + 2) * nb), rj0, nb));
+            *y.add((t + 2) * dout + j + 1) =
+                bj1 + sj1 * (hsum(y21) + mincorr(amn.add((t + 2) * nb), rj1, nb));
+            *y.add((t + 3) * dout + j) =
+                bj0 + sj0 * (hsum(y30) + mincorr(amn.add((t + 3) * nb), rj0, nb));
+            *y.add((t + 3) * dout + j + 1) =
+                bj1 + sj1 * (hsum(y31) + mincorr(amn.add((t + 3) * nb), rj1, nb));
             t += 4;
         }
         while t < n {
-            *y.add(t * dout + j) = bj0 + sj0 * dot_q8(x.add(t * din), wj0, din);
-            *y.add(t * dout + j + 1) = bj1 + sj1 * dot_q8(x.add(t * din), wj1, din);
+            let (cst, cmt) = (asc.add(t * nb), amn.add(t * nb));
+            *y.add(t * dout + j) =
+                bj0 + sj0 * dot_q8(xq.add(t * din), wj0, cst, cmt, rj0, nb);
+            *y.add(t * dout + j + 1) =
+                bj1 + sj1 * dot_q8(xq.add(t * din), wj1, cst, cmt, rj1, nb);
             t += 1;
         }
         j += 2;
@@ -297,8 +521,10 @@ unsafe fn linear_q8(x: *const f32, w_off: usize, s_off: usize, b_off: usize,
         // dout is a multiple of 16 for every registered model; kept for safety
         let wj = wp.add(j * din);
         let (sj, bj) = (*sp.add(j), *bp.add(j));
+        let rj = rp.add(j * nb);
         for t in 0..n {
-            *y.add(t * dout + j) = bj + sj * dot_q8(x.add(t * din), wj, din);
+            *y.add(t * dout + j) = bj + sj * dot_q8(
+                xq.add(t * din), wj, asc.add(t * nb), amn.add(t * nb), rj, nb);
         }
         j += 1;
     }
@@ -415,6 +641,7 @@ pub extern "C" fn forward(n_tokens: i32) {
         }
 
         let mut cq = Cur(0); // byte cursor into the QW int8 region
+        let mut cr = Cur(0); // row cursor into RSUM (parallel to cq)
         for _l in 0..L {
             if QUANT_INT8 {
                 let qs = c.take(H); let qb = c.take(H);
@@ -427,17 +654,24 @@ pub extern "C" fn forward(n_tokens: i32) {
                 let fg = c.take(H); let fb = c.take(H);
                 let qw = cq.take(H * H); let kw = cq.take(H * H); let vw = cq.take(H * H);
                 let aow = cq.take(H * H); let fiw = cq.take(I * H); let fow = cq.take(H * I);
+                let qr = cr.take(H * (H / BQ)); let kr = cr.take(H * (H / BQ));
+                let vr = cr.take(H * (H / BQ)); let aor = cr.take(H * (H / BQ));
+                let fir = cr.take(I * (H / BQ)); let fo_r = cr.take(H * (I / BQ));
 
-                linear_q8(X.as_ptr(), qw, qs, qb, Q.as_mut_ptr(), n, H, H);
-                linear_q8(X.as_ptr(), kw, ks, kb, K.as_mut_ptr(), n, H, H);
-                linear_q8(X.as_ptr(), vw, vs, vb, VA.as_mut_ptr(), n, H, H);
+                quant_rows(X.as_ptr(), n, H);
+                linear_q8(qw, qr, qs, qb, Q.as_mut_ptr(), n, H, H);
+                linear_q8(kw, kr, ks, kb, K.as_mut_ptr(), n, H, H);
+                linear_q8(vw, vr, vs, vb, VA.as_mut_ptr(), n, H, H);
                 attention(n);
-                linear_q8(ATT.as_ptr(), aow, aos, aob, PROJ.as_mut_ptr(), n, H, H);
+                quant_rows(ATT.as_ptr(), n, H);
+                linear_q8(aow, aor, aos, aob, PROJ.as_mut_ptr(), n, H, H);
                 add_residual_ln(X.as_mut_ptr(), ag, ab, n);
 
-                linear_q8(X.as_ptr(), fiw, fis, fib, FFN1.as_mut_ptr(), n, H, I);
+                quant_rows(X.as_ptr(), n, H);
+                linear_q8(fiw, fir, fis, fib, FFN1.as_mut_ptr(), n, H, I);
                 for i in 0..n * I { FFN1[i] = gelu(FFN1[i]); }
-                linear_q8(FFN1.as_ptr(), fow, fos, fob, PROJ.as_mut_ptr(), n, I, H);
+                quant_rows(FFN1.as_ptr(), n, I);
+                linear_q8(fow, fo_r, fos, fob, PROJ.as_mut_ptr(), n, I, H);
                 add_residual_ln(X.as_mut_ptr(), fg, fb, n);
             } else {
                 let qw = c.take(H * H); let qb = c.take(H);

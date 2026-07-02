@@ -20,13 +20,17 @@ KEYS = os.environ.get("PGT_MODELS", "").split(",") if os.environ.get("PGT_MODELS
     else list(registry.load_registry())
 
 
+# auto picks the relaxed-simd kernel when the session's V8 supports it and
+# the baseline one otherwise; 'baseline' forces the kernel every V8 can run,
+# so both code paths stay covered on a modern plv8
+@pytest.mark.parametrize("flavor", [None, "baseline"], ids=["auto", "baseline"])
 @pytest.mark.parametrize("key", KEYS)
-def test_parity(key):
+def test_parity(key, flavor):
     refs = os.path.join(registry.artifacts_dir(), f"{key}_refs.json")
     if not os.path.exists(refs):
         pytest.skip(f"no artifacts for {key}; run export+load first")
     refs_emb = int(os.environ.get("PGT_REFS_EMB", "0"))
-    assert verify(key, refs_emb=refs_emb), f"{key} failed parity"
+    assert verify(key, refs_emb=refs_emb, flavor=flavor), f"{key} failed parity"
 
 
 def test_spm_mirror_matches_refs():

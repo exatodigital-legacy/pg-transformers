@@ -18,7 +18,7 @@ import psycopg
 from . import registry
 
 
-def verify(key, dsn=None, refs_emb=0, thru_long=20, thru_short=40):
+def verify(key, dsn=None, refs_emb=0, thru_long=20, thru_short=40, flavor=None):
     art = registry.artifacts_dir()
     refs = json.load(open(os.path.join(art, f"{key}_refs.json"), encoding="utf-8"))
     emb_refs = refs if refs_emb <= 0 else refs[:: max(1, len(refs) // refs_emb)][:refs_emb]
@@ -28,7 +28,7 @@ def verify(key, dsn=None, refs_emb=0, thru_long=20, thru_short=40):
 
     conn = psycopg.connect(dsn or registry.default_dsn(), autocommit=True)
     cur = conn.cursor()
-    cur.execute("select pgt_load(%s)", (key,))
+    cur.execute("select pgt_load(%s,%s)", (key, flavor))
     print(cur.fetchone()[0])
     ok = True
 
@@ -54,10 +54,15 @@ def verify(key, dsn=None, refs_emb=0, thru_long=20, thru_short=40):
           f">{thr}={100*(cs2>thr).mean():.1f}%")
 
     # 4. throughput, reported the way the community reports embedders:
-    #    tokens/s on documents at a stated length, latency in ms for queries
+    #    tokens/s on documents at a stated length, latency in ms for queries.
+    #    Warm up first so the numbers are steady-state optimized code: V8
+    #    tiers wasm up from its baseline compiler and cannot switch mid-call,
+    #    so the first calls of a session run slower (see README).
     long_ids = [r["ids"] for r in refs if len(r["ids"]) > 120][:thru_long]
     short_ids = [r["ids"] for r in refs if 5 < len(r["ids"]) < 30][:thru_short]
     if long_ids:
+        cur.execute("select pgt_bench_ids(%s,%s,1)", (key, json.dumps(long_ids[:2])))
+        cur.fetchone()
         cur.execute("select pgt_bench_ids(%s,%s,1)", (key, json.dumps(long_ids)))
         ms = cur.fetchone()[0]
         ntok = sum(len(x) for x in long_ids)

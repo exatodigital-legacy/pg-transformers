@@ -57,17 +57,21 @@ min_cosine = 0.99       # verify threshold vs the fp32 original
 ```
 
 Linear weights and the word table are stored as int8 with one f32 scale per
-output row and dequantized on the fly in the kernel; biases, LayerNorm and
-positions stay f32. Weights shrink 4x. The port is no longer bit-exact, so
-`verify` checks cosine against the fp32 PyTorch ground truth using
-`min_cosine` instead of the 0.999 exact-port default; state the measured
-worst-case cosine in your PR. Export reuses the base model's tokenizer and
-reference artifacts when they are present.
+output row; biases, LayerNorm and positions stay f32. Weights shrink 4x. At
+run time the kernel quantizes each linear's input activations to u8 (one
+scale/offset per 128-column block per token) and computes the GEMM in the
+integer domain - `i32x4.dot_i16x8_s` on baseline SIMD, single dot-product
+instructions (SDOT/VNNI) on the relaxed-SIMD build - which also makes the
+int8 variants the fastest ones. The port is no longer bit-exact, so `verify`
+checks cosine against the fp32 PyTorch ground truth using `min_cosine`
+instead of the 0.999 exact-port default; state the measured worst-case
+cosine in your PR. Export reuses the base model's tokenizer and reference
+artifacts when they are present.
 
 ## Sizing
 
 Per-session memory is roughly the f32 weight bytes plus activations and
 tokenizer data: `4 * (vocab_size * hidden + layers * (12 * hidden^2 + ...))`.
 Measured RSS reference points: 22M params = ~0.24GB, 100M = ~0.60GB,
-568M = ~2.4GB; int8 variants ~0.10/0.28/0.78GB. Check the target's memory
+568M = ~2.4GB; int8 variants ~0.11/0.29/0.79GB. Check the target's memory
 with `sql/probe.sql` before porting something big.

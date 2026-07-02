@@ -1,7 +1,10 @@
 -- pg-transformers: transformer sentence embeddings inside PostgreSQL.
 -- Requires only plv8 (V8 with WebAssembly+SIMD). Multiple models coexist,
 -- keyed by name:
---   pgt_model(key, wasm bytea, meta jsonb)
+--   pgt_model(key, wasm bytea, meta jsonb, wasm_relaxed bytea)
+--     wasm_relaxed is the +relaxed-simd kernel build (FMA / int8 dot
+--     products); pgt_load picks it when the session's V8 supports the
+--     feature (V8 11.4+, e.g. plv8 3.2.x) and falls back to wasm otherwise.
 --   pgt_rest(key, idx, chunk bytea)   -- positions+layers, ordered
 --   pgt_word(key, idx, chunk bytea)   -- word-embedding table, ordered
 --   pgt_vocab(key, kind text, data text)  -- kind: 'wordpiece'|'spm'|'fold'|'nfkc'
@@ -13,14 +16,36 @@ CREATE TABLE IF NOT EXISTS pgt_model (key text PRIMARY KEY, wasm bytea, meta jso
 CREATE TABLE IF NOT EXISTS pgt_rest (key text, idx int, chunk bytea, PRIMARY KEY (key, idx));
 CREATE TABLE IF NOT EXISTS pgt_word (key text, idx int, chunk bytea, PRIMARY KEY (key, idx));
 CREATE TABLE IF NOT EXISTS pgt_vocab (key text, kind text, data text, PRIMARY KEY (key, kind));
+ALTER TABLE pgt_model ADD COLUMN IF NOT EXISTS wasm_relaxed bytea;
 
-CREATE OR REPLACE FUNCTION pgt_load(mkey text) RETURNS text LANGUAGE plv8 AS $js$
+-- pre-0.3 installs have a one-argument pgt_load; drop it so the call
+-- pgt_load(key) resolves unambiguously to the two-argument form below
+DROP FUNCTION IF EXISTS pgt_load(text);
+
+CREATE OR REPLACE FUNCTION pgt_load(mkey text, flavor text DEFAULT NULL) RETURNS text LANGUAGE plv8 AS $js$
   globalThis.__pgt = globalThis.__pgt || {};
-  if (globalThis.__pgt[mkey]) return 'already loaded';
+  var cached = globalThis.__pgt[mkey];
+  if (cached && (!flavor || cached.flavor === flavor))
+    return 'already loaded (' + cached.flavor + ')';
   var t0 = Date.now();
   var u8 = function (b) { return (b instanceof Uint8Array) ? b : new Uint8Array(b); };
-  var meta = plv8.execute("select meta from pgt_model where key=$1", [mkey])[0].meta;
-  var wasm = u8(plv8.execute("select wasm from pgt_model where key=$1", [mkey])[0].wasm);
+  var row = plv8.execute(
+    "select meta, wasm, wasm_relaxed from pgt_model where key=$1", [mkey])[0];
+  var meta = row.meta;
+  // does this V8 validate relaxed SIMD? (60-byte probe: f32x4.relaxed_madd)
+  var probe = [0x00,0x61,0x73,0x6d,1,0,0,0, 1,4,1,0x60,0,0, 3,2,1,0,
+               0x0a,0x3e,1,0x3c,0,
+               0xfd,0x0c,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+               0xfd,0x0c,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+               0xfd,0x0c,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+               0xfd,0x85,0x02, 0x1a, 0x0b];
+  var relaxedOk = WebAssembly.validate(new Uint8Array(probe));
+  var use = flavor || ((relaxedOk && row.wasm_relaxed) ? 'relaxed' : 'baseline');
+  if (use === 'relaxed' && !row.wasm_relaxed)
+    plv8.elog(ERROR, 'no relaxed-simd wasm stored for ' + mkey);
+  if (use === 'relaxed' && !relaxedOk)
+    plv8.elog(ERROR, "this V8 has no relaxed SIMD; use flavor 'baseline'");
+  var wasm = u8(use === 'relaxed' ? row.wasm_relaxed : row.wasm);
   var inst = new WebAssembly.Instance(new WebAssembly.Module(wasm));
   var ex = inst.exports;
 
@@ -65,6 +90,7 @@ CREATE OR REPLACE FUNCTION pgt_load(mkey text) RETURNS text LANGUAGE plv8 AS $js
   loadInto("pgt_rest", restRanges);
   loadInto("pgt_word", [{ ptr: wordBase, len: wordBytes }]);
   ex.set_word_base(wordBase);
+  if (ex.prep) ex.prep();  // int8 kernels precompute weight row sums
 
   var vrows = plv8.execute("select kind, data from pgt_vocab where key=$1", [mkey]);
   var vocab = {}, kind = null;
@@ -74,9 +100,10 @@ CREATE OR REPLACE FUNCTION pgt_load(mkey text) RETURNS text LANGUAGE plv8 AS $js
     else if (vrows[i].kind === 'fold') { vocab.fold = JSON.parse(vrows[i].data); }
     else if (vrows[i].kind === 'nfkc') { vocab.nfkc = JSON.parse(vrows[i].data); }
   }
-  globalThis.__pgt[mkey] = { ex: ex, meta: meta, vocab: vocab, kind: kind };
+  globalThis.__pgt[mkey] = { ex: ex, meta: meta, vocab: vocab, kind: kind, flavor: use };
   return 'loaded ' + mkey + ' (' + kind + ', ' + (wordBytes + restBytes + qwBytes) +
-         ' weight bytes) in ' + (Date.now() - t0) + 'ms';
+         ' weight bytes, ' + (use === 'relaxed' ? 'relaxed-simd' : 'simd128') +
+         ') in ' + (Date.now() - t0) + 'ms';
 $js$;
 
 -- WordPiece (BERT), cased or uncased per meta. Returns int[] ids.

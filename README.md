@@ -18,7 +18,9 @@ tokenizer id match, verified on a multilingual reference corpus plus an
 adversarial Unicode suite (emoji, CJK, zero-width and bidi characters,
 ligatures). `pg-transformers verify` reruns that proof against your database.
 Each model also has an int8 variant that trades exact parity (cosine still
-at or above 0.998) for a 3x smaller memory footprint.
+at or above 0.997) for a 3x smaller memory footprint and, where the V8 in
+plv8 has relaxed SIMD (plv8 3.2.x; PostgreSQL 18 on AWS), about 1.5x the
+fp32 throughput.
 
 ## Models
 
@@ -37,9 +39,12 @@ adversarial Unicode edge cases. Reproduce with `pg-transformers verify <key>`.
 
 Each model also has a weight-only int8 variant (`all-minilm-int8`,
 `serafim-100m-int8`, `bge-m3-int8`): linear weights and the word table are
-stored as int8 with one f32 scale per row and dequantized on the fly in the
-kernel. Same tokenizer, same verify pipeline, but parity is no longer exact;
-the measured numbers are in the benchmarks below.
+stored as int8 with one f32 scale per row. The kernel quantizes activations
+per token (block-wise, one scale per 128 columns) and runs the GEMMs in the
+integer domain with SIMD dot-product instructions, so the int8 variants are
+the fastest as well as the smallest. Same tokenizer, same verify pipeline,
+but parity is no longer exact; the measured numbers are in the benchmarks
+below.
 
 Weights are converted locally from HuggingFace by you (bring-your-own-weights);
 this repository contains no model weights.
@@ -48,37 +53,49 @@ this repository contains no model weights.
 
 In-DB, single core, Apple M-series (server-grade Arm is typically 2-4x
 slower per core), measured by `pg-transformers verify` on its reference
-corpus. Throughput is tokens embedded per second on full-length documents
-(512 tokens; 256 for all-minilm, its maximum). Query latency is the
-end-to-end time to embed one short query (10-30 tokens), the interactive
-path. Cosine is the worst case against the PyTorch original over the
-corpus. RAM is the measured PostgreSQL backend RSS after loading the model
-and embedding (weights + tokenizer data + activations); every session that
-embeds holds its own copy.
+corpus, after warmup. Throughput is tokens embedded per second on
+full-length documents (512 tokens; 256 for all-minilm, its maximum). Query
+latency is the end-to-end time to embed one short query (10-30 tokens), the
+interactive path. Cosine is the worst case against the PyTorch original
+over the corpus. RAM is the measured PostgreSQL backend RSS after loading
+the model and embedding (weights + tokenizer data + activations); every
+session that embeds holds its own copy.
 
-| Key | Cosine vs PyTorch (worst) | RAM per session | Throughput | Query latency |
-|---|---|---|---|---|
-| `all-minilm` | 0.999999 | 0.24GB | 1910 tok/s | 10 ms |
-| `all-minilm-int8` | 0.9985 | 0.10GB | 1740 tok/s | 11 ms |
-| `serafim-100m` | 1.000000 | 0.60GB | 244 tok/s | 71 ms |
-| `serafim-100m-int8` | 0.9991 | 0.28GB | 224 tok/s | 77 ms |
-| `bge-m3` | 0.999999 | 2.4GB | 68 tok/s | 253 ms |
-| `bge-m3-int8` | 0.9979 | 0.78GB | 60 tok/s | 277 ms |
+Two numbers per model because there are two kernel flavors: plv8 3.2.x
+(PostgreSQL 18 on AWS) has relaxed SIMD (FMA, int8 dot products) and runs
+the fast kernels; plv8 3.1.x (PostgreSQL 14-17 on AWS) runs the baseline
+SIMD kernels. `pgt_load` detects and picks automatically; the load message
+says which one you got.
 
-In document terms: serafim-100m embeds a full 512-token document in about
-2.1s, bge-m3 in about 7.6s, and all-minilm a 256-token document in 134ms.
-Choose int8 for the memory footprint (bge-m3 drops from 2.4GB to 0.78GB per
-session, and weights shrink 4x on disk too), not for speed: on Apple Silicon
-it runs within about 10% of fp32, since the dequantization compute roughly
-cancels what the smaller weight loads save.
+| Key | Cosine (worst) | RAM | plv8 3.2: tok/s | query | plv8 3.1: tok/s | query |
+|---|---|---|---|---|---|---|
+| `all-minilm` | 0.999999 | 0.24GB | 2237 | 8.6 ms | 1945 | 9.9 ms |
+| `all-minilm-int8` | 0.9973 | 0.11GB | 2924 | 6.3 ms | 1786 | 10.6 ms |
+| `serafim-100m` | 0.999999 | 0.60GB | 284 | 60 ms | 250 | 69 ms |
+| `serafim-100m-int8` | 0.9990 | 0.29GB | 363 | 43 ms | 231 | 74 ms |
+| `bge-m3` | 0.999999 | 2.4GB | 80 | 216 ms | 68 | 249 ms |
+| `bge-m3-int8` | 0.9973 | 0.79GB | 102 | 144 ms | 67 | 243 ms |
 
-For calibration: this is roughly 7-10x slower than native PyTorch on the
-same CPU, the cost of wasm's 128-bit SIMD with no FMA, and the price of
-needing no native extensions. In practice it matters less than it looks:
-queries (the latency-critical path) are milliseconds, documents embed once
-at write time, and bulk backfill scales linearly with parallel sessions
-since each PostgreSQL backend runs on its own core (budget RAM per the
-table above).
+In document terms, on relaxed SIMD: serafim-100m-int8 embeds a full
+512-token document in about 1.4s (fp32: 1.8s), bge-m3-int8 in about 5s
+(fp32: 6.4s), and all-minilm-int8 a 256-token document in 88ms. On modern
+plv8 the int8 variants are the fastest and smallest option; on plv8 3.1
+they match fp32 speed on Arm (the baseline integer path pays off on x86,
+where `i32x4.dot_i16x8_s` lowers to a single instruction) and still keep
+the 3x memory win.
+
+Two one-time costs to know about: the first embed of a session runs 20-30%
+slower while V8 warms the wasm up to its optimizing compiler (it cannot
+switch mid-call; `SET plv8.v8_flags = '--no-liftoff'` before the first
+plv8 call removes the penalty entirely), and int8 models spend a moment in
+`pgt_load` precomputing weight row sums.
+
+For calibration: fp32 is roughly 6-9x slower than native PyTorch on the
+same CPU, the cost of wasm's 128-bit SIMD, and the price of needing no
+native extensions. In practice it matters less than it looks: queries (the
+latency-critical path) are milliseconds, documents embed once at write
+time, and bulk backfill scales linearly with parallel sessions since each
+PostgreSQL backend runs on its own core (budget RAM per the table above).
 
 ## Prerequisites
 
@@ -96,7 +113,7 @@ export PGT_DSN="host=... port=5432 user=... dbname=..."   # or --dsn per command
 # 0. can your PostgreSQL run this? (ten seconds, works on any provider)
 pg-transformers probe
 
-# 1. build the 10KB wasm kernel and convert the model from HuggingFace
+# 1. build the wasm kernels (baseline + relaxed-simd twin) and convert the model from HuggingFace
 kernel/build.sh all-minilm
 pg-transformers export all-minilm
 
@@ -124,9 +141,12 @@ so sessions live long.
 
 - `kernel/` is a small Rust encoder forward pass (embeddings, multi-head
   attention, GELU FFN, LayerNorm, pooling, L2 normalize) compiled to
-  wasm32+simd128, about 10KB. Model dims are compile-time constants that
+  wasm32+simd128, about 10-25KB. Model dims are compile-time constants that
   `build.rs` generates from `models.toml`; `quant = "int8"` entries compile
-  the dequantizing kernel instead.
+  the integer-GEMM kernel instead. Every model builds twice: a baseline
+  SIMD blob that any plv8 3.1+ runs, and a relaxed-SIMD twin (FMA, int8
+  dot products) that `pgt_load` picks automatically when the session's V8
+  validates the feature (plv8 3.2.x / V8 11.4+).
 - `sql/pg_transformers.sql` holds the loader and tokenizers. The loader
   streams weight chunks from tables into wasm memory via a cursor; tokenizers
   (WordPiece and sentencepiece-unigram Viterbi) run in plv8 JavaScript with

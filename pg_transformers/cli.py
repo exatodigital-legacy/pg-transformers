@@ -36,6 +36,8 @@ def main(argv=None):
                     help="subsample embed loops to N refs (0 = all; tokenizer always all)")
     pv.add_argument("--thru-long", type=int, default=20)
     pv.add_argument("--thru-short", type=int, default=40)
+    pv.add_argument("--flavor", choices=["baseline", "relaxed"], default=None,
+                    help="force a kernel flavor (default: auto-detect)")
 
     pp = sub.add_parser("probe", help="capability check for a database")
     pp.add_argument("--dsn", default=None)
@@ -52,8 +54,8 @@ def main(argv=None):
             load(k, dsn=a.dsn, skip_weights=a.skip_weights)
     elif a.cmd == "verify":
         from .verify import verify
-        ok = all([verify(k, dsn=a.dsn, refs_emb=a.refs_emb,
-                         thru_long=a.thru_long, thru_short=a.thru_short) for k in a.keys])
+        ok = all([verify(k, dsn=a.dsn, refs_emb=a.refs_emb, thru_long=a.thru_long,
+                         thru_short=a.thru_short, flavor=a.flavor) for k in a.keys])
         sys.exit(0 if ok else 1)
     elif a.cmd == "probe":
         import psycopg
