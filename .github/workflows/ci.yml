@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: build every registered model
+        run: kernel/build.sh
+
+  # Full cycle on the smallest model: build a plv8 Postgres, convert
+  # all-MiniLM from HF, load, and require exact parity + edge cases.
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: start Postgres + plv8
+        run: |
+          docker compose -f docker/compose.yml up -d --wait
+      - name: build, export, load
+        run: |
+          kernel/build.sh all-minilm
+          pip install -e '.[export,test]' --extra-index-url https://download.pytorch.org/whl/cpu
+          pg-transformers export all-minilm
+          pg-transformers load all-minilm
+          pg-transformers probe
+      - name: parity + edge cases
+        env:
+          PGT_MODELS: all-minilm
+        run: pytest tests/ -v

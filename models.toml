@@ -1,0 +1,58 @@
+# pg-transformers model registry. Single source of truth:
+#   - kernel/build.rs reads this (via the PGT_MODEL env var) to generate the
+#     Rust config, so adding a same-architecture model never touches Rust code
+#   - the Python package reads it for export / load / verify
+# Dims must match the HuggingFace config; `pg-transformers export` validates
+# them against the real model and fails loudly on any mismatch.
+#
+# Constraints (SIMD kernel): hidden, intermediate and hidden/heads must be
+# multiples of 16. Architecture must be post-LN BERT/XLM-R shaped.
+# pos_offset: 0 for BERT, 2 for RoBERTa-family position numbering.
+
+[all-minilm]
+hf_id = "sentence-transformers/all-MiniLM-L6-v2"
+license = "Apache-2.0"
+params = "22M"
+languages = "English"
+vocab_size = 30522
+hidden = 384
+layers = 6
+intermediate = 1536
+heads = 12
+max_tokens = 256
+pos_offset = 0
+ln_eps = 1e-12
+pooling = "mean"
+tokenizer = "wordpiece"
+
+[serafim-100m]
+hf_id = "PORTULAN/serafim-100m-portuguese-pt-sentence-encoder-ir"
+license = "MIT"
+params = "100M"
+languages = "Portuguese"
+vocab_size = 29794
+hidden = 768
+layers = 12
+intermediate = 3072
+heads = 12
+max_tokens = 512
+pos_offset = 0
+ln_eps = 1e-12
+pooling = "mean"
+tokenizer = "wordpiece"
+
+[bge-m3]
+hf_id = "BAAI/bge-m3"
+license = "MIT"
+params = "568M"
+languages = "multilingual (100+)"
+vocab_size = 250002
+hidden = 1024
+layers = 24
+intermediate = 4096
+heads = 16
+max_tokens = 512
+pos_offset = 2
+ln_eps = 1e-5
+pooling = "cls"
+tokenizer = "spm"

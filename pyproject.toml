@@ -1,0 +1,29 @@
+[project]
+name = "pg-transformers"
+version = "0.1.0"
+description = "Transformer sentence embeddings inside PostgreSQL: plv8 + WebAssembly, no native extensions"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "psycopg[binary]",
+]
+
+[project.optional-dependencies]
+# converting models needs the ML stack; loading/verifying artifacts does not
+export = ["torch", "sentence-transformers", "transformers", "sentencepiece"]
+test = ["pytest", "transformers", "sentencepiece"]
+
+[project.scripts]
+pg-transformers = "pg_transformers.cli:main"
+
+[project.urls]
+Repository = "https://github.com/exatodigital-legacy/pg-transformers"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pg_transformers"]

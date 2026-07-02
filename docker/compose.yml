@@ -1,0 +1,16 @@
+# Local PostgreSQL + plv8 for development and CI.
+# Any PostgreSQL >= 15 image with plv8 >= 3.1 works; this builds one from
+# source (first build takes a while, then it's cached).
+services:
+  db:
+    build: .
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    shm_size: 1g
+    # bge-m3 needs ~2.5GB free per session on top of shared buffers
+    deploy:
+      resources:
+        limits:
+          memory: 6g
