@@ -37,9 +37,10 @@ Weights are converted locally from HuggingFace by you (bring-your-own-weights);
 this repository contains no model weights.
 
 Measured in-DB throughput, single core (Apple M-series; server-grade Arm is
-typically 2-4x slower per core): all-minilm 220ms/doc and 6ms/query;
-serafim-100m 3.5s/doc (512 tokens) and 46ms/query; bge-m3 13s/doc and
-180ms/query. For calibration: this is roughly 10x slower than native PyTorch
+typically 2-4x slower per core), on the reference corpus that
+`pg-transformers verify` reruns: all-minilm 190ms per 256-token doc and
+14ms/query; serafim-100m 3.0s per 512-token doc and 96ms/query; bge-m3 12s
+per 512-token doc and 380ms/query (queries are 10-30 tokens). For calibration: this is roughly 10x slower than native PyTorch
 on the same CPU, the cost of wasm's 128-bit SIMD with no FMA, and the price
 of needing no native extensions. In practice it matters less than it looks:
 queries (the latency-critical path) are milliseconds, documents embed once at
