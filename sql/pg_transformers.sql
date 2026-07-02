@@ -24,27 +24,46 @@ CREATE OR REPLACE FUNCTION pgt_load(mkey text) RETURNS text LANGUAGE plv8 AS $js
   var inst = new WebAssembly.Instance(new WebAssembly.Module(wasm));
   var ex = inst.exports;
 
-  // grow memory to fit static rest region + dynamically-placed word table
+  // region sizes in bytes; old (pre-int8) wasm modules exported f32 counts
+  var restBytes = ex.n_rest_bytes ? ex.n_rest_bytes() : ex.n_rest() * 4;
+  var qwBytes = ex.n_qw_bytes ? ex.n_qw_bytes() : 0;
+  var wordBytes = ex.n_word_bytes ? ex.n_word_bytes() : ex.n_word() * 4;
+
+  // grow memory to fit static regions + dynamically-placed word table
   var heapBase = ex.__heap_base ? ex.__heap_base.value : ex.__heap_base;
   var wordBase = (heapBase + 15) & ~15;
-  var wordBytes = ex.n_word() * 4;
   var need = wordBase + wordBytes;
   var have = ex.memory.buffer.byteLength;
   if (need > have) ex.memory.grow(Math.ceil((need - have) / 65536));
 
   // Stream chunks ONE AT A TIME via a cursor. plv8.execute() would materialize
   // every chunk simultaneously (2.2GB for bge-m3) on top of the wasm memory and
-  // OOM V8; a cursor holds only the current chunk.
-  function loadInto(tbl, dst, want) {
+  // OOM V8; a cursor holds only the current chunk. A table's byte stream can
+  // span several destination ranges (int8 models append the quantized linear
+  // weights after the f32 part in pgt_rest); chunks may straddle the boundary.
+  function loadInto(tbl, ranges) {
     var plan = plv8.prepare("select chunk from " + tbl + " where key=$1 order by idx", ["text"]);
     var cur = plan.cursor([mkey]);
-    var off = 0, row;
-    while ((row = cur.fetch())) { var c = u8(row.chunk); dst.set(c, off); off += c.length; }
+    var ri = 0, off = 0, row;
+    while ((row = cur.fetch())) {
+      var c = u8(row.chunk), coff = 0;
+      while (coff < c.length) {
+        while (ri < ranges.length && off === ranges[ri].len) { ri++; off = 0; }
+        if (ri >= ranges.length) plv8.elog(ERROR, tbl + ': more bytes than expected');
+        var take = Math.min(c.length - coff, ranges[ri].len - off);
+        new Uint8Array(ex.memory.buffer, ranges[ri].ptr + off, take).set(c.subarray(coff, coff + take));
+        off += take; coff += take;
+      }
+    }
     cur.close(); plan.free();
-    if (off !== want) plv8.elog(ERROR, tbl + ' bytes ' + off + ' != ' + want);
+    while (ri < ranges.length && off === ranges[ri].len) { ri++; off = 0; }
+    if (ri !== ranges.length)
+      plv8.elog(ERROR, tbl + ' incomplete: range ' + ri + ' got ' + off + ' of ' + ranges[ri].len + ' bytes');
   }
-  loadInto("pgt_rest", new Uint8Array(ex.memory.buffer, ex.rest_ptr(), ex.n_rest() * 4), ex.n_rest() * 4);
-  loadInto("pgt_word", new Uint8Array(ex.memory.buffer, wordBase, wordBytes), wordBytes);
+  var restRanges = [{ ptr: ex.rest_ptr(), len: restBytes }];
+  if (qwBytes > 0) restRanges.push({ ptr: ex.qw_ptr(), len: qwBytes });
+  loadInto("pgt_rest", restRanges);
+  loadInto("pgt_word", [{ ptr: wordBase, len: wordBytes }]);
   ex.set_word_base(wordBase);
 
   var vrows = plv8.execute("select kind, data from pgt_vocab where key=$1", [mkey]);
@@ -56,7 +75,7 @@ CREATE OR REPLACE FUNCTION pgt_load(mkey text) RETURNS text LANGUAGE plv8 AS $js
     else if (vrows[i].kind === 'nfkc') { vocab.nfkc = JSON.parse(vrows[i].data); }
   }
   globalThis.__pgt[mkey] = { ex: ex, meta: meta, vocab: vocab, kind: kind };
-  return 'loaded ' + mkey + ' (' + kind + ', ' + (ex.n_word()*4 + ex.n_rest()*4) +
+  return 'loaded ' + mkey + ' (' + kind + ', ' + (wordBytes + restBytes + qwBytes) +
          ' weight bytes) in ' + (Date.now() - t0) + 'ms';
 $js$;
 

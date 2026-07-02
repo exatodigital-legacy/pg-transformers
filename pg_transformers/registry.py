@@ -20,7 +20,17 @@ def sql_path():
 
 def load_registry():
     with open(registry_path(), "rb") as f:
-        return tomllib.load(f)
+        raw = tomllib.load(f)
+    # resolve `base = "<key>"` inheritance (variant entries, e.g. int8)
+    reg = {}
+    for k, m in raw.items():
+        if "base" in m:
+            if m["base"] not in raw:
+                raise KeyError(f"{k}.base = '{m['base']}' not in {registry_path()}")
+            reg[k] = {**raw[m["base"]], **m}
+        else:
+            reg[k] = dict(m)
+    return reg
 
 def model(key):
     reg = load_registry()

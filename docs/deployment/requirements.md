@@ -8,10 +8,11 @@ PostgreSQL has these, it runs, whoever hosts it:
    of ours is ever installed.
 2. **WebAssembly with SIMD** exposed by plv8's V8. True for every plv8 3.1+
    build we have seen, but verify with the probe.
-3. **Memory** for the model you pick, per session that embeds:
-   - all-minilm: ~0.1GB
-   - serafim-100m: ~0.45GB
-   - bge-m3: ~2.3GB
+3. **Memory** for the model you pick, per session that embeds (measured
+   backend RSS: weights + tokenizer data + activations):
+   - all-minilm: ~0.24GB (int8 variant ~0.10GB)
+   - serafim-100m: ~0.60GB (int8 ~0.28GB)
+   - bge-m3: ~2.4GB (int8 ~0.78GB)
 4. **Long-lived sessions.** Weights load once per connection (sub-second for
    small models, a few seconds for bge-m3) and are cached in `globalThis`.
    Use a connection pooler (RDS Proxy, pgbouncer in session mode) so the

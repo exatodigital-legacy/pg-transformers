@@ -35,7 +35,8 @@ CREATE OR REPLACE FUNCTION pgt_probe() RETURNS text LANGUAGE plv8 AS $js$
     line(true, 'wasm SIMD (v128)');
   } catch (e) { line(false, 'wasm SIMD (v128)', '' + e); }
 
-  // 4. memory headroom (bge-m3 needs ~2.3GB; serafim ~0.45GB; minilm ~0.1GB)
+  // 4. memory headroom (bge-m3 needs ~2.3GB in-wasm, int8 variant ~0.6GB;
+  //    serafim ~0.45GB / 0.11GB; minilm ~0.1GB / 0.03GB)
   var mb = 0;
   try {
     for (var pages of [2048, 8192, 16384, 40960]) {  // 128MB..2.5GB

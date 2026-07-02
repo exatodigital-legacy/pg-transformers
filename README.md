@@ -12,11 +12,13 @@ select pgt_embed('bge-m3', 'The contract was terminated for cause.');
 -- float4[1024], unit-normalized, identical to sentence-transformers output
 ```
 
-Embeddings are faithful to the original models: every registered model
+Embeddings are faithful to the original models: every registered fp32 model
 reproduces its HuggingFace/PyTorch output at cosine 1.000000 with exact
 tokenizer id match, verified on a multilingual reference corpus plus an
 adversarial Unicode suite (emoji, CJK, zero-width and bidi characters,
 ligatures). `pg-transformers verify` reruns that proof against your database.
+Each model also has an int8 variant that trades exact parity (cosine still
+at or above 0.998) for a 3x smaller memory footprint.
 
 ## Models
 
@@ -33,20 +35,50 @@ tests/`): exact token-id match on every reference text, end-to-end cosine
 against sentence-transformers output (worst case 0.999999), and the
 adversarial Unicode edge cases. Reproduce with `pg-transformers verify <key>`.
 
+Each model also has a weight-only int8 variant (`all-minilm-int8`,
+`serafim-100m-int8`, `bge-m3-int8`): linear weights and the word table are
+stored as int8 with one f32 scale per row and dequantized on the fly in the
+kernel. Same tokenizer, same verify pipeline, but parity is no longer exact;
+the measured numbers are in the benchmarks below.
+
 Weights are converted locally from HuggingFace by you (bring-your-own-weights);
 this repository contains no model weights.
 
-Measured in-DB throughput, single core (Apple M-series; server-grade Arm is
-typically 2-4x slower per core), on the reference corpus that
-`pg-transformers verify` reruns: all-minilm 190ms per 256-token doc and
-14ms/query; serafim-100m 3.0s per 512-token doc and 96ms/query; bge-m3 12s
-per 512-token doc and 380ms/query (queries are 10-30 tokens). For calibration: this is roughly 10x slower than native PyTorch
-on the same CPU, the cost of wasm's 128-bit SIMD with no FMA, and the price
-of needing no native extensions. In practice it matters less than it looks:
-queries (the latency-critical path) are milliseconds, documents embed once at
-write time, and bulk backfill scales linearly with parallel sessions since
-each PostgreSQL backend runs on its own core (each session holds its own
-copy of the weights, so budget RAM accordingly).
+## Benchmarks
+
+In-DB, single core, Apple M-series (server-grade Arm is typically 2-4x
+slower per core), measured by `pg-transformers verify` on its reference
+corpus. Throughput is tokens embedded per second on full-length documents
+(512 tokens; 256 for all-minilm, its maximum). Query latency is the
+end-to-end time to embed one short query (10-30 tokens), the interactive
+path. Cosine is the worst case against the PyTorch original over the
+corpus. RAM is the measured PostgreSQL backend RSS after loading the model
+and embedding (weights + tokenizer data + activations); every session that
+embeds holds its own copy.
+
+| Key | Cosine vs PyTorch (worst) | RAM per session | Throughput | Query latency |
+|---|---|---|---|---|
+| `all-minilm` | 0.999999 | 0.24GB | 1910 tok/s | 10 ms |
+| `all-minilm-int8` | 0.9985 | 0.10GB | 1740 tok/s | 11 ms |
+| `serafim-100m` | 1.000000 | 0.60GB | 244 tok/s | 71 ms |
+| `serafim-100m-int8` | 0.9991 | 0.28GB | 224 tok/s | 77 ms |
+| `bge-m3` | 0.999999 | 2.4GB | 68 tok/s | 253 ms |
+| `bge-m3-int8` | 0.9979 | 0.78GB | 60 tok/s | 277 ms |
+
+In document terms: serafim-100m embeds a full 512-token document in about
+2.1s, bge-m3 in about 7.6s, and all-minilm a 256-token document in 134ms.
+Choose int8 for the memory footprint (bge-m3 drops from 2.4GB to 0.78GB per
+session, and weights shrink 4x on disk too), not for speed: on Apple Silicon
+it runs within about 10% of fp32, since the dequantization compute roughly
+cancels what the smaller weight loads save.
+
+For calibration: this is roughly 7-10x slower than native PyTorch on the
+same CPU, the cost of wasm's 128-bit SIMD with no FMA, and the price of
+needing no native extensions. In practice it matters less than it looks:
+queries (the latency-critical path) are milliseconds, documents embed once
+at write time, and bulk backfill scales linearly with parallel sessions
+since each PostgreSQL backend runs on its own core (budget RAM per the
+table above).
 
 ## Prerequisites
 
@@ -90,10 +122,11 @@ so sessions live long.
 
 ## How it works
 
-- `kernel/` is a ~250-line Rust encoder forward pass (embeddings, multi-head
+- `kernel/` is a small Rust encoder forward pass (embeddings, multi-head
   attention, GELU FFN, LayerNorm, pooling, L2 normalize) compiled to
   wasm32+simd128, about 10KB. Model dims are compile-time constants that
-  `build.rs` generates from `models.toml`.
+  `build.rs` generates from `models.toml`; `quant = "int8"` entries compile
+  the dequantizing kernel instead.
 - `sql/pg_transformers.sql` holds the loader and tokenizers. The loader
   streams weight chunks from tables into wasm memory via a cursor; tokenizers
   (WordPiece and sentencepiece-unigram Viterbi) run in plv8 JavaScript with

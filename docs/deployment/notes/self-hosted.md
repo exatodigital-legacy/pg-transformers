@@ -12,4 +12,5 @@ x86_64 containers).
   source (https://github.com/plv8/plv8), then run `sql/probe.sql`.
 - Memory: the per-session model weights live in the backend process, not
   shared buffers. Size `work_mem`-style thinking accordingly: N sessions
-  embedding with bge-m3 = N x 2.3GB of RSS on top of normal PostgreSQL usage.
+  embedding with bge-m3 = N x 2.4GB of RSS (0.78GB for bge-m3-int8) on top
+  of normal PostgreSQL usage.

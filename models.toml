@@ -8,6 +8,13 @@
 # Constraints (SIMD kernel): hidden, intermediate and hidden/heads must be
 # multiples of 16. Architecture must be post-LN BERT/XLM-R shaped.
 # pos_offset: 0 for BERT, 2 for RoBERTa-family position numbering.
+#
+# Variant entries: `base = "<key>"` inherits every field from that entry
+# (local fields override). `quant = "int8"` selects weight-only int8:
+# linear weights and the word table are stored as int8 with one f32 scale
+# per output row, dequantized on the fly in the kernel. 4x smaller, faster,
+# but no longer bit-exact vs the fp32 original; `min_cosine` is the verify
+# threshold (exact models use the 0.999 default).
 
 [all-minilm]
 hf_id = "sentence-transformers/all-MiniLM-L6-v2"
@@ -56,3 +63,18 @@ pos_offset = 2
 ln_eps = 1e-5
 pooling = "cls"
 tokenizer = "spm"
+
+[all-minilm-int8]
+base = "all-minilm"
+quant = "int8"
+min_cosine = 0.995
+
+[serafim-100m-int8]
+base = "serafim-100m"
+quant = "int8"
+min_cosine = 0.995
+
+[bge-m3-int8]
+base = "bge-m3"
+quant = "int8"
+min_cosine = 0.995

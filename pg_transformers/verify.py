@@ -22,6 +22,9 @@ def verify(key, dsn=None, refs_emb=0, thru_long=20, thru_short=40):
     art = registry.artifacts_dir()
     refs = json.load(open(os.path.join(art, f"{key}_refs.json"), encoding="utf-8"))
     emb_refs = refs if refs_emb <= 0 else refs[:: max(1, len(refs) // refs_emb)][:refs_emb]
+    # exact (fp32) ports must hit 0.999; quantized variants declare their own
+    # threshold in the registry (min_cosine)
+    thr = float(registry.model(key).get("min_cosine", 0.999))
 
     conn = psycopg.connect(dsn or registry.default_dsn(), autocommit=True)
     cur = conn.cursor()
@@ -40,28 +43,32 @@ def verify(key, dsn=None, refs_emb=0, thru_long=20, thru_short=40):
 
     # 2. numeric parity (reference ids -> bypass tokenizer)
     cs = _cosines(cur, key, "pgt_embed_ids", [(r["ids"], r["emb"]) for r in emb_refs])
-    ok &= cs.min() > 0.999
+    ok &= cs.min() > thr
     print(f"numerics: mean_cos={cs.mean():.6f} worst_cos={cs.min():.6f} "
-          f">0.999={100*(cs>0.999).mean():.1f}%")
+          f">{thr}={100*(cs>thr).mean():.1f}%")
 
     # 3. end-to-end parity (text -> tokenizer -> embed)
     cs2 = _cosines(cur, key, "pgt_embed", [(r["text"], r["emb"]) for r in emb_refs])
-    ok &= cs2.min() > 0.999
+    ok &= cs2.min() > thr
     print(f"end-to-end: mean_cos={cs2.mean():.6f} worst={cs2.min():.6f} "
-          f">0.999={100*(cs2>0.999).mean():.1f}%")
+          f">{thr}={100*(cs2>thr).mean():.1f}%")
 
-    # 4. throughput (reference ids, server-side timing)
+    # 4. throughput, reported the way the community reports embedders:
+    #    tokens/s on documents at a stated length, latency in ms for queries
     long_ids = [r["ids"] for r in refs if len(r["ids"]) > 120][:thru_long]
     short_ids = [r["ids"] for r in refs if 5 < len(r["ids"]) < 30][:thru_short]
     if long_ids:
         cur.execute("select pgt_bench_ids(%s,%s,1)", (key, json.dumps(long_ids)))
         ms = cur.fetchone()[0]
-        mtl = sum(len(x) for x in long_ids) / len(long_ids)
-        print(f"throughput: {ms/len(long_ids):.0f} ms/doc (mean {mtl:.0f} tok), {len(long_ids)} docs")
+        ntok = sum(len(x) for x in long_ids)
+        mtl = ntok / len(long_ids)
+        print(f"throughput: {1000*ntok/ms:.0f} tokens/s on {len(long_ids)} docs "
+              f"(mean {mtl:.0f} tok, {ms/len(long_ids):.0f} ms/doc)")
     if short_ids:
         cur.execute("select pgt_bench_ids(%s,%s,3)", (key, json.dumps(short_ids)))
         ms = cur.fetchone()[0]
-        print(f"            {ms/(3*len(short_ids)):.1f} ms/query (short), {len(short_ids)} queries x3")
+        print(f"query latency: {ms/(3*len(short_ids)):.1f} ms "
+              f"({len(short_ids)} queries of 5-30 tok, x3)")
     conn.close()
     print("verify: " + ("PASS" if ok else "FAIL"))
     return ok

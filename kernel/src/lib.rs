@@ -30,14 +30,28 @@ use cfg::*;
 const DH: usize = H / HEADS;
 const P: usize = MAXN + POS_OFFSET; // only the position rows we can ever index
 const NWORD: usize = V * H;
-const NREST: usize = P * H + H + 2 * H
-    + L * (3 * (H * H + H) + (H * H + H) + 2 * H + (I * H + I) + (H * I + H) + 2 * H);
+// f32 elements in the static rest region. The int8 layout keeps positions,
+// type, LayerNorm params, biases and per-row scales (one per output row,
+// plus one per vocab row for the word table) in f32; the linear weights
+// themselves move to the QW int8 region.
+const NREST: usize = if QUANT_INT8 {
+    P * H + H + 2 * H + V + L * (14 * H + 2 * I)
+} else {
+    P * H + H + 2 * H
+        + L * (3 * (H * H + H) + (H * H + H) + 2 * H + (I * H + I) + (H * I + H) + 2 * H)
+};
+// int8 linear weights, bytes (empty for fp32 models)
+const NQW: usize = if QUANT_INT8 { L * (4 * H * H + 2 * I * H) } else { 0 };
+const WORD_BYTES: usize = NWORD * (if QUANT_INT8 { 1 } else { 4 });
 
 // Only the "rest" (positions + layers) is a static; it stays < 2GB (isize::MAX
 // on wasm32). The word table (~1GB for bge-m3) is placed dynamically above the
 // heap base by the JS loader, and its address is stored in WORD_BASE. Keeping
 // both static would blow the wasm object-file's varint32 offset limit.
 static mut W: [f32; NREST] = [0.0; NREST];
+#[repr(align(16))]
+struct QAligned([i8; NQW]);
+static mut QW: QAligned = QAligned([0; NQW]);
 static mut WORD_BASE: usize = 0;
 static mut IDS: [u32; MAXN] = [0; MAXN];
 static mut X: [f32; MAXN * H] = [0.0; MAXN * H];
@@ -53,11 +67,15 @@ static mut OUT: [f32; H] = [0.0; H];
 #[no_mangle]
 pub extern "C" fn rest_ptr() -> *mut f32 { unsafe { W.as_mut_ptr() } }
 #[no_mangle]
+pub extern "C" fn qw_ptr() -> *mut i8 { unsafe { QW.0.as_mut_ptr() } }
+#[no_mangle]
 pub extern "C" fn set_word_base(addr_bytes: u32) { unsafe { WORD_BASE = addr_bytes as usize; } }
 #[no_mangle]
-pub extern "C" fn n_word() -> i32 { NWORD as i32 }
+pub extern "C" fn n_word_bytes() -> i32 { WORD_BYTES as i32 }
 #[no_mangle]
-pub extern "C" fn n_rest() -> i32 { NREST as i32 }
+pub extern "C" fn n_rest_bytes() -> i32 { (NREST * 4) as i32 }
+#[no_mangle]
+pub extern "C" fn n_qw_bytes() -> i32 { NQW as i32 }
 #[no_mangle]
 pub extern "C" fn ids_ptr() -> *mut u32 { unsafe { IDS.as_mut_ptr() } }
 #[no_mangle]
@@ -101,39 +119,188 @@ unsafe fn linear(x: *const f32, w_off: usize, b_off: usize, y: *mut f32,
                  n: usize, din: usize, dout: usize) {
     let wp = W.as_ptr().add(w_off);
     let bp = W.as_ptr().add(b_off);
-    // register-block 4 tokens per weight row: the kernel is load-bandwidth
-    // bound (2 loads per madd), so amortizing each weight load over 4 tokens
-    // cuts weight traffic 4x; the 4 accumulator chains also add ILP.
-    for j in 0..dout {
-        let wj = wp.add(j * din);
-        let bj = *bp.add(j);
+    // register-block 2 output rows x 4 tokens: each weight load is reused
+    // across 4 tokens and each activation load across 2 rows (0.75 loads per
+    // madd vs 2 unblocked) - the kernel is bound by loads, not compute. Each
+    // (row,token) pair accumulates in its own single chain, in weight order,
+    // so results do not depend on the blocking.
+    let mut j = 0;
+    while j + 2 <= dout {
+        let wj0 = wp.add(j * din);
+        let wj1 = wp.add((j + 1) * din);
+        let (bj0, bj1) = (*bp.add(j), *bp.add(j + 1));
         let mut t = 0;
         while t + 4 <= n {
             let (x0, x1, x2, x3) = (x.add(t * din), x.add((t + 1) * din),
                                     x.add((t + 2) * din), x.add((t + 3) * din));
-            let mut a0 = f32x4_splat(0.0);
-            let mut a1 = f32x4_splat(0.0);
-            let mut a2 = f32x4_splat(0.0);
-            let mut a3 = f32x4_splat(0.0);
+            let mut a00 = f32x4_splat(0.0); let mut a01 = f32x4_splat(0.0);
+            let mut a10 = f32x4_splat(0.0); let mut a11 = f32x4_splat(0.0);
+            let mut a20 = f32x4_splat(0.0); let mut a21 = f32x4_splat(0.0);
+            let mut a30 = f32x4_splat(0.0); let mut a31 = f32x4_splat(0.0);
             let mut i = 0;
             while i < din {
-                let wv = v128_load(wj.add(i) as *const v128);
-                a0 = madd(wv, v128_load(x0.add(i) as *const v128), a0);
-                a1 = madd(wv, v128_load(x1.add(i) as *const v128), a1);
-                a2 = madd(wv, v128_load(x2.add(i) as *const v128), a2);
-                a3 = madd(wv, v128_load(x3.add(i) as *const v128), a3);
+                let w0 = v128_load(wj0.add(i) as *const v128);
+                let w1 = v128_load(wj1.add(i) as *const v128);
+                let mut xv;
+                xv = v128_load(x0.add(i) as *const v128);
+                a00 = madd(w0, xv, a00); a01 = madd(w1, xv, a01);
+                xv = v128_load(x1.add(i) as *const v128);
+                a10 = madd(w0, xv, a10); a11 = madd(w1, xv, a11);
+                xv = v128_load(x2.add(i) as *const v128);
+                a20 = madd(w0, xv, a20); a21 = madd(w1, xv, a21);
+                xv = v128_load(x3.add(i) as *const v128);
+                a30 = madd(w0, xv, a30); a31 = madd(w1, xv, a31);
                 i += 4;
             }
-            *y.add(t * dout + j) = bj + hsum(a0);
-            *y.add((t + 1) * dout + j) = bj + hsum(a1);
-            *y.add((t + 2) * dout + j) = bj + hsum(a2);
-            *y.add((t + 3) * dout + j) = bj + hsum(a3);
+            *y.add(t * dout + j) = bj0 + hsum(a00);
+            *y.add(t * dout + j + 1) = bj1 + hsum(a01);
+            *y.add((t + 1) * dout + j) = bj0 + hsum(a10);
+            *y.add((t + 1) * dout + j + 1) = bj1 + hsum(a11);
+            *y.add((t + 2) * dout + j) = bj0 + hsum(a20);
+            *y.add((t + 2) * dout + j + 1) = bj1 + hsum(a21);
+            *y.add((t + 3) * dout + j) = bj0 + hsum(a30);
+            *y.add((t + 3) * dout + j + 1) = bj1 + hsum(a31);
             t += 4;
         }
         while t < n {
-            *y.add(t * dout + j) = bj + dot(x.add(t * din), wj, din);
+            *y.add(t * dout + j) = bj0 + dot(x.add(t * din), wj0, din);
+            *y.add(t * dout + j + 1) = bj1 + dot(x.add(t * din), wj1, din);
             t += 1;
         }
+        j += 2;
+    }
+    while j < dout {
+        // dout is a multiple of 16 for every registered model; kept for safety
+        let wj = wp.add(j * din);
+        let bj = *bp.add(j);
+        for t in 0..n {
+            *y.add(t * dout + j) = bj + dot(x.add(t * din), wj, din);
+        }
+        j += 1;
+    }
+}
+
+/// widen 16 int8 weights (one v128 load) to 4 f32x4 vectors
+#[inline(always)]
+unsafe fn dequant16(wq: v128) -> (v128, v128, v128, v128) {
+    let lo = i16x8_extend_low_i8x16(wq);
+    let hi = i16x8_extend_high_i8x16(wq);
+    (f32x4_convert_i32x4(i32x4_extend_low_i16x8(lo)),
+     f32x4_convert_i32x4(i32x4_extend_high_i16x8(lo)),
+     f32x4_convert_i32x4(i32x4_extend_low_i16x8(hi)),
+     f32x4_convert_i32x4(i32x4_extend_high_i16x8(hi)))
+}
+
+/// int8-weight dot product against f32 activations; k is a multiple of 16.
+/// The caller applies the row scale to the result.
+#[inline]
+unsafe fn dot_q8(a: *const f32, w: *const i8, k: usize) -> f32 {
+    let mut acc0 = f32x4_splat(0.0);
+    let mut acc1 = f32x4_splat(0.0);
+    let mut acc2 = f32x4_splat(0.0);
+    let mut acc3 = f32x4_splat(0.0);
+    let mut i = 0;
+    while i < k {
+        let (w0, w1, w2, w3) = dequant16(v128_load(w.add(i) as *const v128));
+        acc0 = madd(w0, v128_load(a.add(i) as *const v128), acc0);
+        acc1 = madd(w1, v128_load(a.add(i + 4) as *const v128), acc1);
+        acc2 = madd(w2, v128_load(a.add(i + 8) as *const v128), acc2);
+        acc3 = madd(w3, v128_load(a.add(i + 12) as *const v128), acc3);
+        i += 16;
+    }
+    hsum(f32x4_add(f32x4_add(acc0, acc1), f32x4_add(acc2, acc3)))
+}
+
+/// weight-only int8 linear: weight rows live in QW as int8, W holds one f32
+/// scale per output row (s_off) and the bias (b_off). Register-blocks 2
+/// output rows x 4 tokens: each dequantized weight vector is reused across
+/// 4 tokens and each activation load across 2 rows, so the loop does ~0.6
+/// loads per madd where the fp32 kernel does 1.25 - this path is bound by
+/// load-port throughput, not compute. Each (row,token) pair accumulates in
+/// its own single chain, in weight order, regardless of the blocking.
+unsafe fn linear_q8(x: *const f32, w_off: usize, s_off: usize, b_off: usize,
+                    y: *mut f32, n: usize, din: usize, dout: usize) {
+    let wp = QW.0.as_ptr().add(w_off);
+    let sp = W.as_ptr().add(s_off);
+    let bp = W.as_ptr().add(b_off);
+    let mut j = 0;
+    while j + 2 <= dout {
+        let wj0 = wp.add(j * din);
+        let wj1 = wp.add((j + 1) * din);
+        let (sj0, sj1) = (*sp.add(j), *sp.add(j + 1));
+        let (bj0, bj1) = (*bp.add(j), *bp.add(j + 1));
+        let mut t = 0;
+        while t + 4 <= n {
+            let (x0, x1, x2, x3) = (x.add(t * din), x.add((t + 1) * din),
+                                    x.add((t + 2) * din), x.add((t + 3) * din));
+            let mut a00 = f32x4_splat(0.0); let mut a01 = f32x4_splat(0.0);
+            let mut a10 = f32x4_splat(0.0); let mut a11 = f32x4_splat(0.0);
+            let mut a20 = f32x4_splat(0.0); let mut a21 = f32x4_splat(0.0);
+            let mut a30 = f32x4_splat(0.0); let mut a31 = f32x4_splat(0.0);
+            let mut i = 0;
+            while i < din {
+                let (p0, p1, p2, p3) = dequant16(v128_load(wj0.add(i) as *const v128));
+                let (q0, q1, q2, q3) = dequant16(v128_load(wj1.add(i) as *const v128));
+                let mut xv;
+                xv = v128_load(x0.add(i) as *const v128);
+                a00 = madd(p0, xv, a00); a01 = madd(q0, xv, a01);
+                xv = v128_load(x1.add(i) as *const v128);
+                a10 = madd(p0, xv, a10); a11 = madd(q0, xv, a11);
+                xv = v128_load(x2.add(i) as *const v128);
+                a20 = madd(p0, xv, a20); a21 = madd(q0, xv, a21);
+                xv = v128_load(x3.add(i) as *const v128);
+                a30 = madd(p0, xv, a30); a31 = madd(q0, xv, a31);
+                xv = v128_load(x0.add(i + 4) as *const v128);
+                a00 = madd(p1, xv, a00); a01 = madd(q1, xv, a01);
+                xv = v128_load(x1.add(i + 4) as *const v128);
+                a10 = madd(p1, xv, a10); a11 = madd(q1, xv, a11);
+                xv = v128_load(x2.add(i + 4) as *const v128);
+                a20 = madd(p1, xv, a20); a21 = madd(q1, xv, a21);
+                xv = v128_load(x3.add(i + 4) as *const v128);
+                a30 = madd(p1, xv, a30); a31 = madd(q1, xv, a31);
+                xv = v128_load(x0.add(i + 8) as *const v128);
+                a00 = madd(p2, xv, a00); a01 = madd(q2, xv, a01);
+                xv = v128_load(x1.add(i + 8) as *const v128);
+                a10 = madd(p2, xv, a10); a11 = madd(q2, xv, a11);
+                xv = v128_load(x2.add(i + 8) as *const v128);
+                a20 = madd(p2, xv, a20); a21 = madd(q2, xv, a21);
+                xv = v128_load(x3.add(i + 8) as *const v128);
+                a30 = madd(p2, xv, a30); a31 = madd(q2, xv, a31);
+                xv = v128_load(x0.add(i + 12) as *const v128);
+                a00 = madd(p3, xv, a00); a01 = madd(q3, xv, a01);
+                xv = v128_load(x1.add(i + 12) as *const v128);
+                a10 = madd(p3, xv, a10); a11 = madd(q3, xv, a11);
+                xv = v128_load(x2.add(i + 12) as *const v128);
+                a20 = madd(p3, xv, a20); a21 = madd(q3, xv, a21);
+                xv = v128_load(x3.add(i + 12) as *const v128);
+                a30 = madd(p3, xv, a30); a31 = madd(q3, xv, a31);
+                i += 16;
+            }
+            *y.add(t * dout + j) = bj0 + sj0 * hsum(a00);
+            *y.add(t * dout + j + 1) = bj1 + sj1 * hsum(a01);
+            *y.add((t + 1) * dout + j) = bj0 + sj0 * hsum(a10);
+            *y.add((t + 1) * dout + j + 1) = bj1 + sj1 * hsum(a11);
+            *y.add((t + 2) * dout + j) = bj0 + sj0 * hsum(a20);
+            *y.add((t + 2) * dout + j + 1) = bj1 + sj1 * hsum(a21);
+            *y.add((t + 3) * dout + j) = bj0 + sj0 * hsum(a30);
+            *y.add((t + 3) * dout + j + 1) = bj1 + sj1 * hsum(a31);
+            t += 4;
+        }
+        while t < n {
+            *y.add(t * dout + j) = bj0 + sj0 * dot_q8(x.add(t * din), wj0, din);
+            *y.add(t * dout + j + 1) = bj1 + sj1 * dot_q8(x.add(t * din), wj1, din);
+            t += 1;
+        }
+        j += 2;
+    }
+    while j < dout {
+        // dout is a multiple of 16 for every registered model; kept for safety
+        let wj = wp.add(j * din);
+        let (sj, bj) = (*sp.add(j), *bp.add(j));
+        for t in 0..n {
+            *y.add(t * dout + j) = bj + sj * dot_q8(x.add(t * din), wj, din);
+        }
+        j += 1;
     }
 }
 
@@ -217,40 +384,83 @@ pub extern "C" fn forward(n_tokens: i32) {
         let typ = c.take(H);
         let eg = c.take(H);
         let eb = c.take(H);
+        let wsc = if QUANT_INT8 { c.take(V) } else { 0 }; // per-vocab-row word scales
 
-        let word = WORD_BASE as *const f32;
-        for t in 0..n {
-            let id = (IDS[t] as usize).min(V - 1);
-            let xr = X.as_mut_ptr().add(t * H);
-            for d in 0..H {
-                *xr.add(d) = *word.add(id * H + d)
-                    + W[pos + (t + POS_OFFSET) * H + d]
-                    + W[typ + d];
+        if QUANT_INT8 {
+            let word = WORD_BASE as *const i8;
+            for t in 0..n {
+                let id = (IDS[t] as usize).min(V - 1);
+                let s = W[wsc + id];
+                let wr = word.add(id * H);
+                let xr = X.as_mut_ptr().add(t * H);
+                for d in 0..H {
+                    *xr.add(d) = s * (*wr.add(d) as f32)
+                        + W[pos + (t + POS_OFFSET) * H + d]
+                        + W[typ + d];
+                }
+                ln_row(xr, eg, eb);
             }
-            ln_row(xr, eg, eb);
+        } else {
+            let word = WORD_BASE as *const f32;
+            for t in 0..n {
+                let id = (IDS[t] as usize).min(V - 1);
+                let xr = X.as_mut_ptr().add(t * H);
+                for d in 0..H {
+                    *xr.add(d) = *word.add(id * H + d)
+                        + W[pos + (t + POS_OFFSET) * H + d]
+                        + W[typ + d];
+                }
+                ln_row(xr, eg, eb);
+            }
         }
 
+        let mut cq = Cur(0); // byte cursor into the QW int8 region
         for _l in 0..L {
-            let qw = c.take(H * H); let qb = c.take(H);
-            let kw = c.take(H * H); let kb = c.take(H);
-            let vw = c.take(H * H); let vb = c.take(H);
-            let aow = c.take(H * H); let aob = c.take(H);
-            let ag = c.take(H); let ab = c.take(H);
-            let fiw = c.take(I * H); let fib = c.take(I);
-            let fow = c.take(H * I); let fob = c.take(H);
-            let fg = c.take(H); let fb = c.take(H);
+            if QUANT_INT8 {
+                let qs = c.take(H); let qb = c.take(H);
+                let ks = c.take(H); let kb = c.take(H);
+                let vs = c.take(H); let vb = c.take(H);
+                let aos = c.take(H); let aob = c.take(H);
+                let ag = c.take(H); let ab = c.take(H);
+                let fis = c.take(I); let fib = c.take(I);
+                let fos = c.take(H); let fob = c.take(H);
+                let fg = c.take(H); let fb = c.take(H);
+                let qw = cq.take(H * H); let kw = cq.take(H * H); let vw = cq.take(H * H);
+                let aow = cq.take(H * H); let fiw = cq.take(I * H); let fow = cq.take(H * I);
 
-            linear(X.as_ptr(), qw, qb, Q.as_mut_ptr(), n, H, H);
-            linear(X.as_ptr(), kw, kb, K.as_mut_ptr(), n, H, H);
-            linear(X.as_ptr(), vw, vb, VA.as_mut_ptr(), n, H, H);
-            attention(n);
-            linear(ATT.as_ptr(), aow, aob, PROJ.as_mut_ptr(), n, H, H);
-            add_residual_ln(X.as_mut_ptr(), ag, ab, n);
+                linear_q8(X.as_ptr(), qw, qs, qb, Q.as_mut_ptr(), n, H, H);
+                linear_q8(X.as_ptr(), kw, ks, kb, K.as_mut_ptr(), n, H, H);
+                linear_q8(X.as_ptr(), vw, vs, vb, VA.as_mut_ptr(), n, H, H);
+                attention(n);
+                linear_q8(ATT.as_ptr(), aow, aos, aob, PROJ.as_mut_ptr(), n, H, H);
+                add_residual_ln(X.as_mut_ptr(), ag, ab, n);
 
-            linear(X.as_ptr(), fiw, fib, FFN1.as_mut_ptr(), n, H, I);
-            for i in 0..n * I { FFN1[i] = gelu(FFN1[i]); }
-            linear(FFN1.as_ptr(), fow, fob, PROJ.as_mut_ptr(), n, I, H);
-            add_residual_ln(X.as_mut_ptr(), fg, fb, n);
+                linear_q8(X.as_ptr(), fiw, fis, fib, FFN1.as_mut_ptr(), n, H, I);
+                for i in 0..n * I { FFN1[i] = gelu(FFN1[i]); }
+                linear_q8(FFN1.as_ptr(), fow, fos, fob, PROJ.as_mut_ptr(), n, I, H);
+                add_residual_ln(X.as_mut_ptr(), fg, fb, n);
+            } else {
+                let qw = c.take(H * H); let qb = c.take(H);
+                let kw = c.take(H * H); let kb = c.take(H);
+                let vw = c.take(H * H); let vb = c.take(H);
+                let aow = c.take(H * H); let aob = c.take(H);
+                let ag = c.take(H); let ab = c.take(H);
+                let fiw = c.take(I * H); let fib = c.take(I);
+                let fow = c.take(H * I); let fob = c.take(H);
+                let fg = c.take(H); let fb = c.take(H);
+
+                linear(X.as_ptr(), qw, qb, Q.as_mut_ptr(), n, H, H);
+                linear(X.as_ptr(), kw, kb, K.as_mut_ptr(), n, H, H);
+                linear(X.as_ptr(), vw, vb, VA.as_mut_ptr(), n, H, H);
+                attention(n);
+                linear(ATT.as_ptr(), aow, aob, PROJ.as_mut_ptr(), n, H, H);
+                add_residual_ln(X.as_mut_ptr(), ag, ab, n);
+
+                linear(X.as_ptr(), fiw, fib, FFN1.as_mut_ptr(), n, H, I);
+                for i in 0..n * I { FFN1[i] = gelu(FFN1[i]); }
+                linear(FFN1.as_ptr(), fow, fob, PROJ.as_mut_ptr(), n, I, H);
+                add_residual_ln(X.as_mut_ptr(), fg, fb, n);
+            }
         }
 
         // pool + L2 normalize

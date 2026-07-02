@@ -41,12 +41,12 @@ jobs:
             || docker compose -f docker/compose.yml -f docker/compose.build.yml up -d --wait --build
       - name: build, export, load
         run: |
-          kernel/build.sh all-minilm
+          kernel/build.sh all-minilm all-minilm-int8
           pip install -e '.[export,test]' --extra-index-url https://download.pytorch.org/whl/cpu
-          pg-transformers export all-minilm
-          pg-transformers load all-minilm
+          pg-transformers export all-minilm all-minilm-int8
+          pg-transformers load all-minilm all-minilm-int8
           pg-transformers probe
       - name: parity + edge cases
         env:
-          PGT_MODELS: all-minilm
+          PGT_MODELS: all-minilm,all-minilm-int8
         run: pytest tests/ -v
