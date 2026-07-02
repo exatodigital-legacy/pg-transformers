@@ -7,6 +7,8 @@
 --   pgt_vocab(key, kind text, data text)  -- kind: 'wordpiece'|'spm'|'fold'|'nfkc'
 -- Load a model into the session with pgt_load(key); embed with pgt_embed(key, text).
 
+CREATE EXTENSION IF NOT EXISTS plv8;
+
 CREATE TABLE IF NOT EXISTS pgt_model (key text PRIMARY KEY, wasm bytea, meta jsonb);
 CREATE TABLE IF NOT EXISTS pgt_rest (key text, idx int, chunk bytea, PRIMARY KEY (key, idx));
 CREATE TABLE IF NOT EXISTS pgt_word (key text, idx int, chunk bytea, PRIMARY KEY (key, idx));
