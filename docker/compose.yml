@@ -1,8 +1,10 @@
 # Local PostgreSQL + plv8 for development and CI.
-# Any PostgreSQL >= 15 image with plv8 >= 3.1 works; this builds one from
-# source (first build takes a while, then it's cached).
+# Pulls the prebuilt multi-arch image from GHCR when available; `docker
+# compose up --build` compiles the same thing from source via the Dockerfile
+# (any PostgreSQL >= 15 with plv8 >= 3.1 works).
 services:
   db:
+    image: ghcr.io/exatodigital-legacy/postgres-plv8:17-3.2.4
     build: .
     ports:
       - "5432:5432"

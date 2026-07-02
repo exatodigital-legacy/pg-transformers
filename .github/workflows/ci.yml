@@ -4,6 +4,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   kernel:
     runs-on: ubuntu-latest
@@ -29,8 +33,13 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: start Postgres + plv8
+        # pull the prebuilt GHCR image; fall back to building plv8 from
+        # source if it isn't available (first run, or after a version bump)
         run: |
-          docker compose -f docker/compose.yml up -d --wait
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker compose -f docker/compose.yml pull db || true
+          docker compose -f docker/compose.yml up -d --wait --no-build \
+            || docker compose -f docker/compose.yml up -d --wait --build
       - name: build, export, load
         run: |
           kernel/build.sh all-minilm

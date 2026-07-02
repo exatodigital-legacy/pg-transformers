@@ -1,0 +1,59 @@
+# Builds the PostgreSQL+plv8 image once and pushes it to GHCR, so CI and
+# users can pull it (~30s) instead of compiling plv8 from source (~45min).
+# Reruns only on demand or when the Dockerfile changes.
+name: build-image
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [docker/Dockerfile]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/exatodigital-legacy/postgres-plv8
+  TAG: 17-3.2.4
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" -t "$IMAGE:17" -t "$IMAGE:latest" \
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
