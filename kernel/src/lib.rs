@@ -7,6 +7,16 @@
 use core::arch::wasm32::*;
 use libm::{erff, expf, sqrtf};
 
+// fused multiply-add when built with +relaxed-simd (feature-detect at load
+// time and pick the kernel; V8 11.4+ supports it), else mul+add
+#[inline(always)]
+unsafe fn madd(a: v128, b: v128, acc: v128) -> v128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    { f32x4_relaxed_madd(a, b, acc) }
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    { f32x4_add(acc, f32x4_mul(a, b)) }
+}
+
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
@@ -57,6 +67,12 @@ pub extern "C" fn max_tokens() -> i32 { MAXN as i32 }
 #[no_mangle]
 pub extern "C" fn hidden() -> i32 { H as i32 }
 
+#[inline(always)]
+unsafe fn hsum(v: v128) -> f32 {
+    f32x4_extract_lane::<0>(v) + f32x4_extract_lane::<1>(v)
+        + f32x4_extract_lane::<2>(v) + f32x4_extract_lane::<3>(v)
+}
+
 /// SIMD dot product; k is a multiple of 16 for all supported dims.
 #[inline]
 unsafe fn dot(a: *const f32, b: *const f32, k: usize) -> f32 {
@@ -66,14 +82,14 @@ unsafe fn dot(a: *const f32, b: *const f32, k: usize) -> f32 {
     let mut acc3 = f32x4_splat(0.0);
     let mut i = 0;
     while i < k {
-        acc0 = f32x4_add(acc0, f32x4_mul(v128_load(a.add(i) as *const v128),
-                                          v128_load(b.add(i) as *const v128)));
-        acc1 = f32x4_add(acc1, f32x4_mul(v128_load(a.add(i + 4) as *const v128),
-                                          v128_load(b.add(i + 4) as *const v128)));
-        acc2 = f32x4_add(acc2, f32x4_mul(v128_load(a.add(i + 8) as *const v128),
-                                          v128_load(b.add(i + 8) as *const v128)));
-        acc3 = f32x4_add(acc3, f32x4_mul(v128_load(a.add(i + 12) as *const v128),
-                                          v128_load(b.add(i + 12) as *const v128)));
+        acc0 = madd(v128_load(a.add(i) as *const v128),
+                    v128_load(b.add(i) as *const v128), acc0);
+        acc1 = madd(v128_load(a.add(i + 4) as *const v128),
+                    v128_load(b.add(i + 4) as *const v128), acc1);
+        acc2 = madd(v128_load(a.add(i + 8) as *const v128),
+                    v128_load(b.add(i + 8) as *const v128), acc2);
+        acc3 = madd(v128_load(a.add(i + 12) as *const v128),
+                    v128_load(b.add(i + 12) as *const v128), acc3);
         i += 16;
     }
     let s = f32x4_add(f32x4_add(acc0, acc1), f32x4_add(acc2, acc3));
@@ -85,11 +101,38 @@ unsafe fn linear(x: *const f32, w_off: usize, b_off: usize, y: *mut f32,
                  n: usize, din: usize, dout: usize) {
     let wp = W.as_ptr().add(w_off);
     let bp = W.as_ptr().add(b_off);
-    for t in 0..n {
-        let xr = x.add(t * din);
-        let yr = y.add(t * dout);
-        for j in 0..dout {
-            *yr.add(j) = *bp.add(j) + dot(xr, wp.add(j * din), din);
+    // register-block 4 tokens per weight row: the kernel is load-bandwidth
+    // bound (2 loads per madd), so amortizing each weight load over 4 tokens
+    // cuts weight traffic 4x; the 4 accumulator chains also add ILP.
+    for j in 0..dout {
+        let wj = wp.add(j * din);
+        let bj = *bp.add(j);
+        let mut t = 0;
+        while t + 4 <= n {
+            let (x0, x1, x2, x3) = (x.add(t * din), x.add((t + 1) * din),
+                                    x.add((t + 2) * din), x.add((t + 3) * din));
+            let mut a0 = f32x4_splat(0.0);
+            let mut a1 = f32x4_splat(0.0);
+            let mut a2 = f32x4_splat(0.0);
+            let mut a3 = f32x4_splat(0.0);
+            let mut i = 0;
+            while i < din {
+                let wv = v128_load(wj.add(i) as *const v128);
+                a0 = madd(wv, v128_load(x0.add(i) as *const v128), a0);
+                a1 = madd(wv, v128_load(x1.add(i) as *const v128), a1);
+                a2 = madd(wv, v128_load(x2.add(i) as *const v128), a2);
+                a3 = madd(wv, v128_load(x3.add(i) as *const v128), a3);
+                i += 4;
+            }
+            *y.add(t * dout + j) = bj + hsum(a0);
+            *y.add((t + 1) * dout + j) = bj + hsum(a1);
+            *y.add((t + 2) * dout + j) = bj + hsum(a2);
+            *y.add((t + 3) * dout + j) = bj + hsum(a3);
+            t += 4;
+        }
+        while t < n {
+            *y.add(t * dout + j) = bj + dot(x.add(t * din), wj, din);
+            t += 1;
         }
     }
 }
@@ -140,7 +183,7 @@ unsafe fn attention(n: usize) {
                 let p = f32x4_splat(SCORES[s] * inv);
                 let vp = VA.as_ptr().add(s * H + ho);
                 for j in 0..DH / 4 {
-                    acc[j] = f32x4_add(acc[j], f32x4_mul(p, v128_load(vp.add(4 * j) as *const v128)));
+                    acc[j] = madd(p, v128_load(vp.add(4 * j) as *const v128), acc[j]);
                 }
             }
             let ap = ATT.as_mut_ptr().add(t * H + ho);
