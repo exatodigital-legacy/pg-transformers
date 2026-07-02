@@ -36,10 +36,16 @@ adversarial Unicode edge cases. Reproduce with `pg-transformers verify <key>`.
 Weights are converted locally from HuggingFace by you (bring-your-own-weights);
 this repository contains no model weights.
 
-Approximate in-DB throughput (Apple M-series, single core; server-grade Arm
-is typically 2-4x slower per core): all-minilm 220ms/doc and 6ms/query;
-serafim-100m 3.5s/doc and 46ms/query; bge-m3 13s/doc and 180ms/query.
-Documents embed at write time (trigger or batch); queries at search time.
+Measured in-DB throughput, single core (Apple M-series; server-grade Arm is
+typically 2-4x slower per core): all-minilm 220ms/doc and 6ms/query;
+serafim-100m 3.5s/doc (512 tokens) and 46ms/query; bge-m3 13s/doc and
+180ms/query. For calibration: this is roughly 10x slower than native PyTorch
+on the same CPU, the cost of wasm's 128-bit SIMD with no FMA, and the price
+of needing no native extensions. In practice it matters less than it looks:
+queries (the latency-critical path) are milliseconds, documents embed once at
+write time, and bulk backfill scales linearly with parallel sessions since
+each PostgreSQL backend runs on its own core (each session holds its own
+copy of the weights, so budget RAM accordingly).
 
 ## Prerequisites
 
