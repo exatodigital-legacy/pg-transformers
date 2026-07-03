@@ -69,12 +69,15 @@ static mut OUT: [f32; H] = [0.0; H];
 // token - per-token ranges are inflated by transformer outlier channels
 // (visible as a cosine drop on the 24-layer bge-m3), per-block ranges are
 // not. The GEMM then runs in the integer domain: i32x4.dot_i16x8_s on
-// baseline SIMD, or the relaxed i8 dot (SDOT/VNNI) with +relaxed-simd. The
+// baseline SIMD, or the relaxed i8 dot (SDOT) with +relaxed-simd. The
 // relaxed instruction only guarantees portable results when its second
-// operand is 7-bit, so that path splits each u8 activation as
-// a = 2*(a>>1) + (a&1) and chains three dots (hi, hi, lo) - exact u8
-// reconstruction, both halves in [0,127].
+// operand is 7-bit, so relaxed builds quantize activations to u7 (see
+// QMAXF below) and issue a single dot per 16 columns, with a halved
+// quantization block (BQ 64 vs 128) buying back most of the lost bit.
 const QIN: usize = if QUANT_INT8 { if I > H { I } else { H } } else { 0 };
+#[cfg(target_feature = "relaxed-simd")]
+const BQ: usize = 64; // every H and I is a multiple of this
+#[cfg(not(target_feature = "relaxed-simd"))]
 const BQ: usize = 128; // every H and I is a multiple of this
 const MAXNB: usize = QIN / BQ;
 const NASC: usize = if QUANT_INT8 { MAXN * MAXNB } else { 0 };
@@ -85,6 +88,12 @@ const NASC: usize = if QUANT_INT8 { MAXN * MAXNB } else { 0 };
 const NROWS: usize = if QUANT_INT8 {
     L * (4 * H * (H / BQ) + I * (H / BQ) + H * (I / BQ))
 } else { 0 };
+// relaxed builds quantize activations to 7 bits: the relaxed i8 dot only
+// guarantees portable results when its second operand has no high bit, so
+// u7 activations allow a single dot per 16 columns (vs a 3-dot u8 split).
+#[cfg(target_feature = "relaxed-simd")]
+const QMAXF: f32 = 127.0;
+#[cfg(not(target_feature = "relaxed-simd"))]
 const QMAXF: f32 = 255.0;
 #[repr(align(16))]
 struct XqAligned([u8; MAXN * QIN]);
@@ -299,23 +308,31 @@ unsafe fn quant_rows(x: *const f32, n: usize, k: usize) {
     }
 }
 
+/// s8 weights x u7 activations -> i32x4 accumulate, one v128 of columns:
+/// one fused relaxed dot (1 SDOT on Arm TurboFan). The u7 activations keep
+/// it inside the spec's deterministic envelope. Not used on x86: V8 lowers
+/// it to a 5-instruction pmaddubsw chain until 12.6 (no VNNI), and the V8
+/// 11.5 in plv8 3.2.x miscompiles it under Liftoff (crbug 1484978, fixed
+/// in 11.9) - measured slower-or-equal to the baseline kernel there, so
+/// pgt_load auto-picks baseline for quant kernels on x86.
+#[cfg(target_feature = "relaxed-simd")]
+#[inline(always)]
+unsafe fn rdot(w: v128, a: v128, acc: v128) -> v128 {
+    i32x4_relaxed_dot_i8x16_i7x16_add(w, a, acc)
+}
+
 /// one BQ-block of the u8-activation x int8-weight dot product, in the
 /// integer domain. The caller applies the block scale and offset.
 #[inline]
 unsafe fn dot_q8_blk(a: *const u8, w: *const i8) -> i32 {
     #[cfg(target_feature = "relaxed-simd")]
     {
-        let one = u8x16_splat(1);
         let mut acc = i32x4_splat(0);
         let mut i = 0;
         while i < BQ {
             let wv = v128_load(w.add(i) as *const v128);
             let av = v128_load(a.add(i) as *const v128);
-            let ahi = u8x16_shr(av, 1);
-            let alo = v128_and(av, one);
-            acc = i32x4_relaxed_dot_i8x16_i7x16_add(wv, ahi, acc);
-            acc = i32x4_relaxed_dot_i8x16_i7x16_add(wv, ahi, acc);
-            acc = i32x4_relaxed_dot_i8x16_i7x16_add(wv, alo, acc);
+            acc = rdot(wv, av, acc);
             i += 16;
         }
         hsum_i32(acc)
@@ -407,40 +424,19 @@ unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
                     let w1v = v128_load(wj1.add(i) as *const v128);
                     #[cfg(target_feature = "relaxed-simd")]
                     {
-                        let one = u8x16_splat(1);
-                        let mut av; let mut ahi; let mut alo;
+                        let mut av;
                         av = v128_load(x0.add(i) as *const v128);
-                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
-                        a00 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a00);
-                        a00 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a00);
-                        a00 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a00);
-                        a01 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a01);
-                        a01 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a01);
-                        a01 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a01);
+                        a00 = rdot(w0v, av, a00);
+                        a01 = rdot(w1v, av, a01);
                         av = v128_load(x1.add(i) as *const v128);
-                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
-                        a10 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a10);
-                        a10 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a10);
-                        a10 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a10);
-                        a11 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a11);
-                        a11 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a11);
-                        a11 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a11);
+                        a10 = rdot(w0v, av, a10);
+                        a11 = rdot(w1v, av, a11);
                         av = v128_load(x2.add(i) as *const v128);
-                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
-                        a20 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a20);
-                        a20 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a20);
-                        a20 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a20);
-                        a21 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a21);
-                        a21 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a21);
-                        a21 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a21);
+                        a20 = rdot(w0v, av, a20);
+                        a21 = rdot(w1v, av, a21);
                         av = v128_load(x3.add(i) as *const v128);
-                        ahi = u8x16_shr(av, 1); alo = v128_and(av, one);
-                        a30 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a30);
-                        a30 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, ahi, a30);
-                        a30 = i32x4_relaxed_dot_i8x16_i7x16_add(w0v, alo, a30);
-                        a31 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a31);
-                        a31 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, ahi, a31);
-                        a31 = i32x4_relaxed_dot_i8x16_i7x16_add(w1v, alo, a31);
+                        a30 = rdot(w0v, av, a30);
+                        a31 = rdot(w1v, av, a31);
                     }
                     #[cfg(not(target_feature = "relaxed-simd"))]
                     {

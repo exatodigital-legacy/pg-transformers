@@ -1,6 +1,6 @@
 [project]
 name = "pg-transformers"
-version = "0.3.1"
+version = "0.3.2"
 description = "Transformer sentence embeddings inside PostgreSQL: plv8 + WebAssembly, no native extensions"
 readme = "README.md"
 license = { text = "Apache-2.0" }

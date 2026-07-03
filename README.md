@@ -24,9 +24,9 @@ tokenizer id match, verified on a multilingual reference corpus plus an
 adversarial Unicode suite (emoji, CJK, zero-width and bidi characters,
 ligatures). `pg-transformers verify` reruns that proof against your database.
 Each model also has an int8 variant that trades exact parity (cosine still
-at or above 0.997) for a 3x smaller memory footprint and the highest
+at or above 0.996) for a 3x smaller memory footprint and the highest
 throughput of the set; on Arm cores with relaxed SIMD (plv8 3.2.x;
-PostgreSQL 18 on AWS) the gap over fp32 reaches 1.3-1.5x.
+PostgreSQL 18 on AWS) the gap over fp32 reaches 1.5-1.6x.
 
 ## Models
 
@@ -46,9 +46,10 @@ adversarial Unicode edge cases. Reproduce with `pg-transformers verify <key>`.
 Each model also has a weight-only int8 variant (`all-minilm-int8`,
 `serafim-100m-int8`, `bge-m3-int8`): linear weights and the word table are
 stored as int8 with one f32 scale per row. The kernel quantizes activations
-per token (block-wise, one scale per 128 columns) and runs the GEMMs in the
-integer domain with SIMD dot-product instructions, so the int8 variants are
-the fastest as well as the smallest. Same tokenizer, same verify pipeline,
+per token (block-wise; exact u8 on the baseline kernel, u7 on the relaxed
+one, which is what lets it use a single relaxed dot per 16 columns) and
+runs the GEMMs in the integer domain with SIMD dot-product instructions,
+so the int8 variants are the fastest as well as the smallest. Same tokenizer, same verify pipeline,
 but parity is no longer exact; the measured numbers are in the benchmarks
 below.
 
@@ -77,11 +78,11 @@ On a laptop (Apple M5 Max performance core, plv8 3.2.4):
 | Key | Cosine (worst) | RAM | relaxed: tok/s | query | baseline: tok/s | query |
 |---|---|---|---|---|---|---|
 | `all-minilm` | 0.999999 | 0.24GB | 2237 | 8.6 ms | 1945 | 9.9 ms |
-| `all-minilm-int8` | 0.9973 | 0.11GB | 2924 | 6.3 ms | 1786 | 10.6 ms |
+| `all-minilm-int8` | 0.9964 | 0.11GB | 3452 | 5.1 ms | 1786 | 10.6 ms |
 | `serafim-100m` | 0.999999 | 0.60GB | 284 | 60 ms | 250 | 69 ms |
-| `serafim-100m-int8` | 0.9990 | 0.29GB | 363 | 43 ms | 231 | 74 ms |
+| `serafim-100m-int8` | 0.9987 | 0.29GB | 433 | 33 ms | 231 | 74 ms |
 | `bge-m3` | 0.999999 | 2.4GB | 80 | 216 ms | 68 | 249 ms |
-| `bge-m3-int8` | 0.9973 | 0.79GB | 102 | 144 ms | 67 | 243 ms |
+| `bge-m3-int8` | 0.9967 | 0.79GB | 130 | 106 ms | 67 | 243 ms |
 
 On server cores (EC2, PostgreSQL + plv8 in Docker, single session; cells
 are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
@@ -90,32 +91,36 @@ are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
 | Key | Graviton4 PG 18 | Graviton4 PG 14-17 | Xeon SPR PG 18 | Xeon SPR PG 14-17 |
 |---|---|---|---|---|
 | `all-minilm` | 962 · 19 ms | 875 · 21 ms | 873 · 18 ms | 758 · 21 ms |
-| `all-minilm-int8` | 1286 · 14 ms | 745 · 25 ms | 1001 · 13 ms | 983 · 14 ms |
+| `all-minilm-int8` | 1472 · 11 ms | 745 · 25 ms | 1001 · 13 ms | 983 · 14 ms |
 | `serafim-100m` | 137 · 131 ms | 123 · 151 ms | 122 · 141 ms | 109 · 163 ms |
-| `serafim-100m-int8` | 177 · 94 ms | 104 · 170 ms | 149 · 93 ms | 148 · 93 ms |
+| `serafim-100m-int8` | 206 · 73 ms | 104 · 170 ms | 149 · 93 ms | 148 · 93 ms |
 | `bge-m3` | 40 · 461 ms | 36 · 507 ms | 33 · 454 ms | 29 · 526 ms |
-| `bge-m3-int8` | 51 · 310 ms | 31 · 550 ms | 44 · 298 ms | 44 · 301 ms |
+| `bge-m3-int8` | 65 · 235 ms | 31 · 550 ms | 44 · 298 ms | 44 · 301 ms |
 
 (Graviton4 = c8g.2xlarge, Neoverse V2; Xeon SPR = c7i.2xlarge, Sapphire
 Rapids Platinum 8488C.)
 
 What the two tables say: a server core runs these kernels 2.0-2.4x slower
 than an M5 Max core, with Graviton4 and Sapphire Rapids within about 15% of
-each other. The int8 variants are the fastest option everywhere. On Arm,
-relaxed SIMD is where the int8 speed lives (SDOT; 1.4-1.7x the baseline
-kernel), so PostgreSQL 18 is a real upgrade on Graviton. On x86 the int8
-models run the baseline kernel on every PostgreSQL version, so PG 14-17
-give up almost nothing there; PG 18 buys x86 only the fp32 FMA gain
-(~10%). plv8 3.1.10's older V8 costs about 5% versus the same baseline
-kernel on plv8 3.2.4.
+each other on the paths they share. The int8 variants are the fastest
+option everywhere. On Arm, relaxed SIMD is where the int8 speed lives (one
+SDOT per 16 columns; about 2x the baseline kernel), so PostgreSQL 18 is a
+real upgrade on Graviton. On x86 the int8 models run the baseline kernel
+on every PostgreSQL version, so PG 14-17 give up almost nothing there; PG
+18 buys x86 only the fp32 FMA gain (~10%). plv8 3.1.10's older V8 costs
+about 5% versus the same baseline kernel on plv8 3.2.4.
 
-Why int8 ignores relaxed SIMD on x86: V8's optimizing compiler lowers the
-relaxed int8 dot product slower than the baseline `i32x4.dot_i16x8_s` path
-there (measured 2x slower), and its first-tier compiler mis-lowers the
-instruction's operand signedness on VNNI hardware, corrupting the first
-embeds of a session until tier-up (verified on Sapphire Rapids; caught by
-`verify`). `pgt_load` therefore never auto-picks it for quantized kernels
-on x86, and you should not force `--flavor relaxed` on one.
+Why int8 ignores relaxed SIMD on x86: the V8 in plv8 3.2.x (11.5) lowers
+the relaxed int8 dot to a 5-instruction sequence on all x86 (VNNI support
+only arrived in V8 12.6, which no plv8 carries), so it cannot beat the
+baseline `i32x4.dot_i16x8_s` kernel there; measured, it ties at best. On
+top of that, V8 11.5's baseline compiler has a register-allocation bug in
+that instruction (crbug.com/1484978, fixed in V8 11.9) that corrupts the
+first embeds of a session until tier-up (verified on Sapphire Rapids;
+caught by `verify`). `pgt_load` therefore never auto-picks relaxed for
+quantized kernels on x86, and you should not force `--flavor relaxed` on
+one. On Arm neither problem exists, and the relaxed kernel is both correct
+and much faster.
 
 ### What the wasm layer costs
 
@@ -126,8 +131,8 @@ thread). serafim-100m shown; tokens/s:
 
 | Runtime (single core) | Graviton4 fp32 | Graviton4 int8 | Xeon SPR fp32 | Xeon SPR int8 |
 |---|---|---|---|---|
-| in-database (plv8 3.2.4) | 137 | 177 | 122 | 149 |
-| same wasm, Node 22 | 151 | 185 | 151 | 181 |
+| in-database (plv8 3.2.4) | 137 | 206 | 122 | 149 |
+| same wasm, Node 22 | 151 | 218 | 151 | 181 |
 | native, PyTorch fp32 | 927 | - | 841 | - |
 | native, ONNX Runtime int8 | - | 894 | - | 2504 |
 

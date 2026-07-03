@@ -11,7 +11,7 @@ us-east-1, db.t4g instances (2026-07).
   (V8 11.5) and gets the relaxed-SIMD kernels (FMA; int8 SDOT on Graviton).
   Aurora PostgreSQL 14-17 ship plv8 3.1.10 (V8 9.7): baseline SIMD only,
   `pgt_load` falls back automatically. On Graviton instances PG 18 is worth
-  1.4-1.7x on the int8 models (measured on Graviton4, README server table);
+  about 2x on the int8 models (measured on Graviton4, README server table);
   on x86 instances the int8 models run the baseline kernel on every engine
   version, so PG 18 matters much less there.
 - AWS builds set `plv8.memory_limit = 256` (MB). This does not block wasm:
