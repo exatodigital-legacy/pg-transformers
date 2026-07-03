@@ -66,7 +66,7 @@ the baseline SIMD kernels. `pgt_load` picks per session: relaxed when the
 V8 supports it, except for int8 models on x86, which run the baseline
 kernel everywhere (see below). The load message says which one you got.
 
-On a laptop (Apple M4 Pro core, plv8 3.2.4):
+On a laptop (Apple M5 Max performance core, plv8 3.2.4):
 
 | Key | Cosine (worst) | RAM | relaxed: tok/s | query | baseline: tok/s | query |
 |---|---|---|---|---|---|---|
@@ -94,7 +94,7 @@ are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
 Rapids Platinum 8488C.)
 
 What the two tables say: a server core runs these kernels 2.0-2.4x slower
-than an M4 core, with Graviton4 and Sapphire Rapids within about 15% of
+than an M5 Max core, with Graviton4 and Sapphire Rapids within about 15% of
 each other. The int8 variants are the fastest option everywhere. On Arm,
 relaxed SIMD is where the int8 speed lives (SDOT; 1.4-1.7x the baseline
 kernel), so PostgreSQL 18 is a real upgrade on Graviton. On x86 the int8

@@ -21,7 +21,7 @@ us-east-1, db.t4g instances (2026-07).
   `ArrayBuffer`). The loader handles both; custom code should too.
 - Sizing: the README server table has measured Graviton4 numbers (c8g, the
   same Neoverse V2 core as db.r8g/db.m8g): about half the per-core speed of
-  an Apple M4. A db.t4g (burstable Graviton2) is roughly half of that
+  an Apple M5 Max. A db.t4g (burstable Graviton2) is roughly half of that
   again, plus burst credits. Budget instance memory for the model per
   concurrently-embedding session.
 - Use RDS Proxy or pgbouncer so sessions (and the per-session weight cache)
