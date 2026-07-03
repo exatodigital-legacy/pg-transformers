@@ -12,6 +12,12 @@ select pgt_embed('bge-m3', 'The contract was terminated for cause.');
 -- float4[1024], unit-normalized, identical to sentence-transformers output
 ```
 
+The goal is convenience, not throughput: text is embedded where it already
+lives, in SQL, with no ETL pipeline, no embedding service to deploy, and no
+GPU to operate. A native runtime on a dedicated machine will always be
+faster; the benchmarks below measure by exactly how much, so you can decide
+whether the simpler architecture is fast enough for your workload.
+
 Embeddings are faithful to the original models: every registered fp32 model
 reproduces its HuggingFace/PyTorch output at cosine 1.000000 with exact
 tokenizer id match, verified on a multilingual reference corpus plus an
@@ -129,8 +135,9 @@ Two conclusions. The database layer is nearly free: plv8 runs the wasm
 within 5% of Node on Arm (the larger x86 gap is Node's newer V8, 12.4 vs
 11.5, not PostgreSQL). The real cost is wasm itself: 128-bit SIMD and no
 native int8 GEMM put it at 5-7x slower than native fp32, and further from
-native int8 where VNNI applies (SPR). That is the price of running on a
-managed database with no native extensions. In practice it matters less
+native int8 where VNNI applies (SPR). That is the price of the convenience
+this project exists for: running on a managed database with no native
+extensions and no infrastructure beside it. In practice it matters less
 than it looks: queries (the latency-critical path) are still tens of
 milliseconds, documents embed once at write time, and bulk backfill scales
 linearly with parallel sessions since each PostgreSQL backend runs on its
