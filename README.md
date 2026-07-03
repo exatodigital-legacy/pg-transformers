@@ -18,9 +18,9 @@ tokenizer id match, verified on a multilingual reference corpus plus an
 adversarial Unicode suite (emoji, CJK, zero-width and bidi characters,
 ligatures). `pg-transformers verify` reruns that proof against your database.
 Each model also has an int8 variant that trades exact parity (cosine still
-at or above 0.997) for a 3x smaller memory footprint and, where the V8 in
-plv8 has relaxed SIMD (plv8 3.2.x; PostgreSQL 18 on AWS), about 1.5x the
-fp32 throughput.
+at or above 0.997) for a 3x smaller memory footprint and the highest
+throughput of the set; on Arm cores with relaxed SIMD (plv8 3.2.x;
+PostgreSQL 18 on AWS) the gap over fp32 reaches 1.3-1.5x.
 
 ## Models
 
@@ -51,23 +51,24 @@ this repository contains no model weights.
 
 ## Benchmarks
 
-In-DB, single core, Apple M-series (server-grade Arm is typically 2-4x
-slower per core), measured by `pg-transformers verify` on its reference
-corpus, after warmup. Throughput is tokens embedded per second on
-full-length documents (512 tokens; 256 for all-minilm, its maximum). Query
-latency is the end-to-end time to embed one short query (10-30 tokens), the
-interactive path. Cosine is the worst case against the PyTorch original
-over the corpus. RAM is the measured PostgreSQL backend RSS after loading
-the model and embedding (weights + tokenizer data + activations); every
-session that embeds holds its own copy.
+In-DB, single core (one PostgreSQL backend), measured by `pg-transformers
+verify` on its reference corpus, after warmup. Throughput is tokens
+embedded per second on full-length documents (512 tokens; 256 for
+all-minilm, its maximum). Query latency is the end-to-end time to embed
+one short query (10-30 tokens), the interactive path. Cosine is the worst
+case against the PyTorch original over the corpus. RAM is the measured
+PostgreSQL backend RSS after loading the model and embedding (weights +
+tokenizer data + activations); every session that embeds holds its own copy.
 
-Two numbers per model because there are two kernel flavors: plv8 3.2.x
-(PostgreSQL 18 on AWS) has relaxed SIMD (FMA, int8 dot products) and runs
-the fast kernels; plv8 3.1.x (PostgreSQL 14-17 on AWS) runs the baseline
-SIMD kernels. `pgt_load` detects and picks automatically; the load message
-says which one you got.
+There are two kernel flavors: plv8 3.2.x (PostgreSQL 18 on AWS) has relaxed
+SIMD (FMA, int8 dot products); plv8 3.1.x (PostgreSQL 14-17 on AWS) runs
+the baseline SIMD kernels. `pgt_load` picks per session: relaxed when the
+V8 supports it, except for int8 models on x86, which run the baseline
+kernel everywhere (see below). The load message says which one you got.
 
-| Key | Cosine (worst) | RAM | plv8 3.2: tok/s | query | plv8 3.1: tok/s | query |
+On a laptop (Apple M4 Pro core, plv8 3.2.4):
+
+| Key | Cosine (worst) | RAM | relaxed: tok/s | query | baseline: tok/s | query |
 |---|---|---|---|---|---|---|
 | `all-minilm` | 0.999999 | 0.24GB | 2237 | 8.6 ms | 1945 | 9.9 ms |
 | `all-minilm-int8` | 0.9973 | 0.11GB | 2924 | 6.3 ms | 1786 | 10.6 ms |
@@ -76,26 +77,71 @@ says which one you got.
 | `bge-m3` | 0.999999 | 2.4GB | 80 | 216 ms | 68 | 249 ms |
 | `bge-m3-int8` | 0.9973 | 0.79GB | 102 | 144 ms | 67 | 243 ms |
 
-In document terms, on relaxed SIMD: serafim-100m-int8 embeds a full
-512-token document in about 1.4s (fp32: 1.8s), bge-m3-int8 in about 5s
-(fp32: 6.4s), and all-minilm-int8 a 256-token document in 88ms. On modern
-plv8 the int8 variants are the fastest and smallest option; on plv8 3.1
-they match fp32 speed on Arm (the baseline integer path pays off on x86,
-where `i32x4.dot_i16x8_s` lowers to a single instruction) and still keep
-the 3x memory win.
+On server cores (EC2, PostgreSQL + plv8 in Docker, single session; cells
+are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
+`pgt_load` auto-picks; "PG 14-17" is a real plv8 3.1.10 (V8 9.7):
+
+| Key | Graviton4 PG 18 | Graviton4 PG 14-17 | Xeon SPR PG 18 | Xeon SPR PG 14-17 |
+|---|---|---|---|---|
+| `all-minilm` | 962 · 19 ms | 875 · 21 ms | 873 · 18 ms | 758 · 21 ms |
+| `all-minilm-int8` | 1286 · 14 ms | 745 · 25 ms | 1001 · 13 ms | 983 · 14 ms |
+| `serafim-100m` | 137 · 131 ms | 123 · 151 ms | 122 · 141 ms | 109 · 163 ms |
+| `serafim-100m-int8` | 177 · 94 ms | 104 · 170 ms | 149 · 93 ms | 148 · 93 ms |
+| `bge-m3` | 40 · 461 ms | 36 · 507 ms | 33 · 454 ms | 29 · 526 ms |
+| `bge-m3-int8` | 51 · 310 ms | 31 · 550 ms | 44 · 298 ms | 44 · 301 ms |
+
+(Graviton4 = c8g.2xlarge, Neoverse V2; Xeon SPR = c7i.2xlarge, Sapphire
+Rapids Platinum 8488C.)
+
+What the two tables say: a server core runs these kernels 2.0-2.4x slower
+than an M4 core, with Graviton4 and Sapphire Rapids within about 15% of
+each other. The int8 variants are the fastest option everywhere. On Arm,
+relaxed SIMD is where the int8 speed lives (SDOT; 1.4-1.7x the baseline
+kernel), so PostgreSQL 18 is a real upgrade on Graviton. On x86 the int8
+models run the baseline kernel on every PostgreSQL version, so PG 14-17
+give up almost nothing there; PG 18 buys x86 only the fp32 FMA gain
+(~10%). plv8 3.1.10's older V8 costs about 5% versus the same baseline
+kernel on plv8 3.2.4.
+
+Why int8 ignores relaxed SIMD on x86: V8's optimizing compiler lowers the
+relaxed int8 dot product slower than the baseline `i32x4.dot_i16x8_s` path
+there (measured 2x slower), and its first-tier compiler mis-lowers the
+instruction's operand signedness on VNNI hardware, corrupting the first
+embeds of a session until tier-up (verified on Sapphire Rapids; caught by
+`verify`). `pgt_load` therefore never auto-picks it for quantized kernels
+on x86, and you should not force `--flavor relaxed` on one.
+
+### What the wasm layer costs
+
+Same models, same protocol, same machines, outside the database
+(`bench/node_wasm.js` runs the identical wasm blobs in Node 22;
+`bench/native_cpu.py` runs the fastest CPU-only native paths, single
+thread). serafim-100m shown; tokens/s:
+
+| Runtime (single core) | Graviton4 fp32 | Graviton4 int8 | Xeon SPR fp32 | Xeon SPR int8 |
+|---|---|---|---|---|
+| in-database (plv8 3.2.4) | 137 | 177 | 122 | 149 |
+| same wasm, Node 22 | 151 | 185 | 151 | 181 |
+| native, PyTorch fp32 | 927 | - | 841 | - |
+| native, ONNX Runtime int8 | - | 894 | - | 2504 |
+
+Two conclusions. The database layer is nearly free: plv8 runs the wasm
+within 5% of Node on Arm (the larger x86 gap is Node's newer V8, 12.4 vs
+11.5, not PostgreSQL). The real cost is wasm itself: 128-bit SIMD and no
+native int8 GEMM put it at 5-7x slower than native fp32, and further from
+native int8 where VNNI applies (SPR). That is the price of running on a
+managed database with no native extensions. In practice it matters less
+than it looks: queries (the latency-critical path) are still tens of
+milliseconds, documents embed once at write time, and bulk backfill scales
+linearly with parallel sessions since each PostgreSQL backend runs on its
+own core (budget RAM per the table above; native multi-thread numbers for
+comparison are in `bench/`).
 
 Two one-time costs to know about: the first embed of a session runs 20-30%
 slower while V8 warms the wasm up to its optimizing compiler (it cannot
 switch mid-call; `SET plv8.v8_flags = '--no-liftoff'` before the first
 plv8 call removes the penalty entirely), and int8 models spend a moment in
 `pgt_load` precomputing weight row sums.
-
-For calibration: fp32 is roughly 6-9x slower than native PyTorch on the
-same CPU, the cost of wasm's 128-bit SIMD, and the price of needing no
-native extensions. In practice it matters less than it looks: queries (the
-latency-critical path) are milliseconds, documents embed once at write
-time, and bulk backfill scales linearly with parallel sessions since each
-PostgreSQL backend runs on its own core (budget RAM per the table above).
 
 ## Prerequisites
 

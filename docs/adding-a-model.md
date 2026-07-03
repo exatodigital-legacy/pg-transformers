@@ -60,9 +60,10 @@ Linear weights and the word table are stored as int8 with one f32 scale per
 output row; biases, LayerNorm and positions stay f32. Weights shrink 4x. At
 run time the kernel quantizes each linear's input activations to u8 (one
 scale/offset per 128-column block per token) and computes the GEMM in the
-integer domain - `i32x4.dot_i16x8_s` on baseline SIMD, single dot-product
-instructions (SDOT/VNNI) on the relaxed-SIMD build - which also makes the
-int8 variants the fastest ones. The port is no longer bit-exact, so `verify`
+integer domain - `i32x4.dot_i16x8_s` on baseline SIMD, single SDOT
+instructions on the relaxed-SIMD build (Arm only; on x86 `pgt_load` keeps
+int8 models on the baseline kernel, which V8 lowers better there) - which
+makes the int8 variants the fastest ones. The port is no longer bit-exact, so `verify`
 checks cosine against the fp32 PyTorch ground truth using `min_cosine`
 instead of the 0.999 exact-port default; state the measured worst-case
 cosine in your PR. Export reuses the base model's tokenizer and reference

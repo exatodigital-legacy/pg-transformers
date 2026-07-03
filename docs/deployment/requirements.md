@@ -11,8 +11,14 @@ PostgreSQL has these, it runs, whoever hosts it:
    Relaxed SIMD (FMA and int8 dot-product instructions) is optional and
    picked up automatically when present: plv8 3.2.x bundles V8 11.5, which
    has it; plv8 3.1.x bundles V8 9.7, which does not. On AWS that maps to
-   PostgreSQL 18 (plv8 3.2.4) vs PostgreSQL 14-17 (plv8 3.1.10). The int8
-   variants are 1.5-1.7x faster with it; the fp32 models about 1.15x.
+   PostgreSQL 18 (plv8 3.2.4) vs PostgreSQL 14-17 (plv8 3.1.10). What it
+   buys depends on the CPU: on Arm (Graviton, Apple) the int8 variants are
+   1.4-1.7x faster with it and fp32 about 1.1x; on x86 only the fp32
+   models gain (~10%, FMA). `pgt_load` never auto-picks relaxed for int8
+   models on x86: V8 runs the relaxed int8 dot slower than the baseline
+   kernel there, and V8's first-tier compiler mis-lowers it on VNNI
+   hardware (wrong embeddings until tier-up, measured on Sapphire Rapids).
+   Do not force `--flavor relaxed` for int8 models on x86.
 3. **Memory** for the model you pick, per session that embeds (measured
    backend RSS: weights + tokenizer data + activations):
    - all-minilm: ~0.24GB (int8 variant ~0.11GB)

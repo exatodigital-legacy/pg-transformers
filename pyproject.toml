@@ -1,6 +1,6 @@
 [project]
 name = "pg-transformers"
-version = "0.3.0"
+version = "0.3.1"
 description = "Transformer sentence embeddings inside PostgreSQL: plv8 + WebAssembly, no native extensions"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -11,8 +11,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# converting models needs the ML stack; loading/verifying artifacts does not
-export = ["torch", "sentence-transformers", "transformers", "sentencepiece"]
+# converting models needs the ML stack; loading/verifying artifacts does not.
+# transformers >= 5: older tokenizers keep a trailing space token on
+# whitespace-edge inputs, diverging from sentencepiece (and from this port)
+export = ["torch", "sentence-transformers", "transformers>=5", "sentencepiece"]
 test = ["pytest", "transformers", "sentencepiece"]
 
 [project.scripts]

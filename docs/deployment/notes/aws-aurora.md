@@ -10,15 +10,19 @@ us-east-1, db.t4g instances (2026-07).
 - Kernel flavor by engine version: Aurora PostgreSQL 18 ships plv8 3.2.4
   (V8 11.5) and gets the relaxed-SIMD kernels (FMA; int8 SDOT on Graviton).
   Aurora PostgreSQL 14-17 ship plv8 3.1.10 (V8 9.7): baseline SIMD only,
-  `pgt_load` falls back automatically. If throughput matters, prefer PG 18.
+  `pgt_load` falls back automatically. On Graviton instances PG 18 is worth
+  1.4-1.7x on the int8 models (measured on Graviton4, README server table);
+  on x86 instances the int8 models run the baseline kernel on every engine
+  version, so PG 18 matters much less there.
 - AWS builds set `plv8.memory_limit = 256` (MB). This does not block wasm:
   `WebAssembly.Memory` is allocated outside V8's heap accounting. The GUC is
   also session-settable (`SET plv8.memory_limit = 1024`) with the master user.
 - bytea arrives in plv8 as `Uint8Array` (local source builds may give
   `ArrayBuffer`). The loader handles both; custom code should too.
-- Sizing: a db.t4g (burstable Graviton2) runs the wasm kernel at roughly a
-  quarter of an Apple M-series core. Expect ~4x the throughput numbers in the
-  README; r7g/r8g cores land closer to 2x. Budget instance memory for the
-  model per concurrently-embedding session.
+- Sizing: the README server table has measured Graviton4 numbers (c8g, the
+  same Neoverse V2 core as db.r8g/db.m8g): about half the per-core speed of
+  an Apple M4. A db.t4g (burstable Graviton2) is roughly half of that
+  again, plus burst credits. Budget instance memory for the model per
+  concurrently-embedding session.
 - Use RDS Proxy or pgbouncer so sessions (and the per-session weight cache)
   are long-lived.

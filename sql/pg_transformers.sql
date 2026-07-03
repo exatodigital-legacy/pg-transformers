@@ -40,7 +40,16 @@ CREATE OR REPLACE FUNCTION pgt_load(mkey text, flavor text DEFAULT NULL) RETURNS
                0xfd,0x0c,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                0xfd,0x85,0x02, 0x1a, 0x0b];
   var relaxedOk = WebAssembly.validate(new Uint8Array(probe));
-  var use = flavor || ((relaxedOk && row.wasm_relaxed) ? 'relaxed' : 'baseline');
+  // On x86 the relaxed int8 dot is a bad deal: V8's optimizing compiler
+  // lowers the 3-dot chain slower than the baseline i16 path, and its
+  // baseline compiler (which runs the first calls of a session) gets the
+  // signed x unsigned operand order wrong, corrupting results until
+  // tier-up. Both verified on Xeon SPR; on Arm (SDOT) relaxed is correct
+  // and much faster. So quantized kernels auto-pick relaxed only on Arm;
+  // fp32 kernels (FMA) benefit everywhere.
+  var isArm = /aarch64|arm64/.test(plv8.execute("select version()")[0].version);
+  var wantRelaxed = meta.quant ? isArm : true;
+  var use = flavor || ((relaxedOk && row.wasm_relaxed && wantRelaxed) ? 'relaxed' : 'baseline');
   if (use === 'relaxed' && !row.wasm_relaxed)
     plv8.elog(ERROR, 'no relaxed-simd wasm stored for ' + mkey);
   if (use === 'relaxed' && !relaxedOk)

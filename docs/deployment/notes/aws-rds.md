@@ -6,7 +6,10 @@ well (memory GUC, Uint8Array bytea, pooling, Graviton sizing).
 
 Kernel flavor by engine version mirrors Aurora: RDS PostgreSQL 18 ships plv8
 3.2.4 (V8 11.5, relaxed-SIMD kernels); 14-17 ship plv8 3.1.10 (baseline SIMD
-only, automatic fallback).
+only, automatic fallback). RDS offers x86 instance classes (db.m7i/r7i)
+alongside Graviton: on those, int8 models run the baseline kernel on every
+engine version (see the requirements note on relaxed SIMD and x86), and the
+measured Xeon Sapphire Rapids column in the README server table applies.
 
 RDS PostgreSQL 14-17 additionally support PL/Rust as a native-code
 alternative, but AWS dropped it from RDS PostgreSQL 18, so it is a dead end
