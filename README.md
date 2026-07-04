@@ -53,6 +53,30 @@ so the int8 variants are the fastest as well as the smallest. Same tokenizer, sa
 but parity is no longer exact; the measured numbers are in the benchmarks
 below.
 
+### Mixing with other runtimes
+
+The embeddings are compatible with vectors produced by any other runtime
+of the same model. The port is a faithful reimplementation, not a
+retrained variant, so its vectors live in the model's original embedding
+space. A common setup is to bulk-embed documents outside the database
+(PyTorch or ONNX Runtime on a GPU, an embedding API serving the same
+model) and use pg-transformers only at query time, or the other way
+around. Three rules make it safe:
+
+- Same base model on both sides, same weights. Never mix vectors across
+  models.
+- The outside pipeline must use the standard sentence-transformers
+  conventions: the HF tokenizer, the model's own pooling (CLS for bge-m3,
+  mean for the others), L2 normalization. This port reproduces those
+  exactly, so if the spaces diverge, the difference is on the other side.
+- Pick the wasm variant by how sensitive your ranking is. The fp32
+  kernels deviate from the PyTorch vectors by about 0.1 degree (cosine
+  0.999999), less than typical GPU fp16 noise; mix them freely. The int8
+  kernels add up to a few degrees of noise per vector (cosine 0.996+),
+  which most retrieval workloads never notice, but if results hinge on
+  fine distinctions or on fixed similarity thresholds, compare top-k
+  overlap against the fp32 model on your own data first.
+
 Weights are converted locally from HuggingFace by you (bring-your-own-weights);
 this repository contains no model weights.
 
