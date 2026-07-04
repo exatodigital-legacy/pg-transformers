@@ -1,15 +1,34 @@
 # pg-transformers
 
-Transformer sentence embeddings inside PostgreSQL. A Rust kernel compiled to
-WebAssembly runs in plv8's V8 engine, model weights live in regular tables,
-and tokenizers are plain plv8 JavaScript. No native extensions beyond plv8,
-which means it works on managed PostgreSQL where you cannot install anything:
-AWS Aurora and RDS (verified), and any other offering whose extension
-allow-list includes plv8.
+Sentence embeddings inside [PostgreSQL](https://www.postgresql.org/): turn
+text into vectors with plain SQL, next to the data it describes.
+
+An embedding is a vector of numbers that captures what a text means:
+similar meaning, similar vectors. Stored in a
+[pgvector](https://github.com/pgvector/pgvector) column, embeddings give
+you semantic search, RAG retrieval, recommendations and deduplication
+without leaving SQL. Producing them normally takes a Python service or an
+external embedding API; pg-transformers computes them inside the database
+itself.
+
+It needs nothing but [plv8](https://plv8.github.io/), the PostgreSQL
+extension that embeds [V8](https://v8.dev/), the JavaScript engine behind
+Chrome and Node. The models are transformer encoders compiled from Rust to
+[WebAssembly](https://webassembly.org/) (a portable binary format V8 runs
+safely), model weights live in regular tables, and tokenizers are plain
+plv8 JavaScript. Nothing native gets installed, so it works on managed
+PostgreSQL where you cannot install anything: AWS Aurora and RDS (verified;
+plv8 is on the [supported-extensions list](https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-extensions.html)),
+and any other offering whose extension allow-list includes plv8.
 
 ```sql
 select pgt_embed('bge-m3', 'The contract was terminated for cause.');
--- float4[1024], unit-normalized, identical to sentence-transformers output
+-- float4[1024], unit length, identical to the model's native output
+
+-- with pgvector: top 5 most similar contracts, no services involved
+select id from contracts
+order by embedding <=> pgt_embed('bge-m3', 'early termination')::vector
+limit 5;
 ```
 
 The goal is convenience, not throughput: text is embedded where it already
@@ -19,14 +38,16 @@ faster; the benchmarks below measure by exactly how much, so you can decide
 whether the simpler architecture is fast enough for your workload.
 
 Embeddings are faithful to the original models: every registered fp32 model
-reproduces its HuggingFace/PyTorch output at cosine 1.000000 with exact
-tokenizer id match, verified on a multilingual reference corpus plus an
-adversarial Unicode suite (emoji, CJK, zero-width and bidi characters,
-ligatures). `pg-transformers verify` reruns that proof against your database.
-Each model also has an int8 variant that trades exact parity (cosine still
-at or above 0.996) for a 3x smaller memory footprint and the highest
-throughput of the set; on Arm cores with relaxed SIMD (plv8 3.2.x;
-PostgreSQL 18 on AWS) the gap over fp32 reaches 1.8-2x.
+reproduces the output of its [Hugging Face](https://huggingface.co) /
+PyTorch original at cosine 1.000000 (a cosine similarity of 1.0 means the
+vectors point the same way, which is the comparison retrieval ranking is
+built on) with exact tokenizer id match, verified on a multilingual
+reference corpus plus an adversarial Unicode suite (emoji, CJK, zero-width
+and bidi characters, ligatures). `pg-transformers verify` reruns that proof
+against your database. Each model also has an int8 variant (weights
+compressed to 8-bit integers) that trades exact parity (cosine still at or
+above 0.996) for a 3x smaller memory footprint and the highest throughput
+of the set, up to 2x fp32; the benchmarks below have the numbers.
 
 ## Models
 
@@ -43,7 +64,8 @@ All six registered models are ported and verified end to end in-DB:
 
 Measured on PostgreSQL 17 + plv8 3.2.4 with the full test suite (`pytest
 tests/`): exact token-id match on every reference text, end-to-end cosine
-against sentence-transformers output (worst case 0.999999), and the
+against [sentence-transformers](https://sbert.net) output (worst case
+0.999999), and the
 adversarial Unicode edge cases. Reproduce with `pg-transformers verify <key>`.
 
 The two Serafim models are PORTULAN's sentence-encoder fine-tunes of
@@ -55,14 +77,12 @@ BERTimbau in the form that produces useful sentence embeddings. Note that
 its ranking quality.
 
 Each model also has a weight-only int8 variant (same key plus `-int8`,
-e.g. `serafim-335m-int8`): linear weights and the word table are
-stored as int8 with one f32 scale per row. The kernel quantizes activations
-per token (block-wise; exact u8 on the baseline kernel, u7 on the relaxed
-one, which is what lets it use a single relaxed dot per 16 columns) and
-runs the GEMMs in the integer domain with SIMD dot-product instructions,
-so the int8 variants are the fastest as well as the smallest. Same tokenizer, same verify pipeline,
-but parity is no longer exact; the measured numbers are in the benchmarks
-below.
+e.g. `serafim-335m-int8`): weights compressed to 8-bit integers, run by an
+integer-arithmetic kernel. The int8 variants are the smallest and the
+fastest of the set; the price is that parity is no longer exact (cosine
+0.996+ instead of 1.000000). Same tokenizer, same verify pipeline. The
+measured numbers are in the benchmarks below; the quantization design is
+in [docs/kernel-notes.md](docs/kernel-notes.md).
 
 ### Mixing with other runtimes
 
@@ -93,6 +113,12 @@ this repository contains no model weights.
 
 ## Benchmarks
 
+Short version: the small models embed a search query in 5-20 ms and the
+large ones in under a quarter of a second on any modern core, and the int8
+variants are the fastest option everywhere. The tables quantify that so
+you can pick a model and a hardware target; the analysis after them is for
+readers who want to know why.
+
 In-DB, single core (one PostgreSQL backend), measured by `pg-transformers
 verify` on its reference corpus, after warmup. Throughput is tokens
 embedded per second on full-length documents (512 tokens; 256 for
@@ -100,11 +126,13 @@ all-minilm and 128 for multilingual-minilm, their maxima). Query latency
 is the end-to-end time to embed
 one short query (10-30 tokens), the interactive path. Cosine is the worst
 case against the PyTorch original over the corpus. RAM is the measured
-PostgreSQL backend RSS after loading the model and embedding (weights +
-tokenizer data + activations); every session that embeds holds its own copy.
+memory (RSS) of the PostgreSQL backend after loading the model and
+embedding (weights + tokenizer data + activations); every session that
+embeds holds its own copy.
 
-There are two kernel flavors: plv8 3.2.x (PostgreSQL 18 on AWS) has relaxed
-SIMD (FMA, int8 dot products); plv8 3.1.x (PostgreSQL 14-17 on AWS) runs
+There are two kernel flavors: plv8 3.2.x (PostgreSQL 18 on AWS) has
+[relaxed SIMD](https://github.com/WebAssembly/relaxed-simd) (FMA, int8 dot
+products); plv8 3.1.x (PostgreSQL 14-17 on AWS) runs
 the baseline SIMD kernels. `pgt_load` picks per session: relaxed when the
 V8 supports it, except for int8 models on x86, which run the baseline
 kernel everywhere (see below). The load message says which one you got.
@@ -155,17 +183,13 @@ almost nothing there; PG 18 buys x86 only the fp32 FMA gain (~20%). plv8
 3.1.10's older V8 costs 1-2% versus the same baseline kernel on plv8
 3.2.4 (the x86 int8 columns).
 
-Why int8 ignores relaxed SIMD on x86: the V8 in plv8 3.2.x (11.5) lowers
-the relaxed int8 dot to a 5-instruction sequence on all x86 (VNNI support
-only arrived in V8 12.6, which no plv8 carries), so it cannot beat the
-baseline `i32x4.dot_i16x8_s` kernel there; measured, it ties at best. On
-top of that, V8 11.5's baseline compiler has a register-allocation bug in
-that instruction (crbug.com/1484978, fixed in V8 11.9) that corrupts the
-first embeds of a session until tier-up (verified on Sapphire Rapids;
-caught by `verify`). `pgt_load` therefore never auto-picks relaxed for
-quantized kernels on x86, and you should not force `--flavor relaxed` on
-one. On Arm neither problem exists, and the relaxed kernel is both correct
-and much faster.
+Why int8 ignores relaxed SIMD on x86, in one line: plv8's V8 lowers the
+relaxed int8 dot product poorly on x86 and its first-tier compiler
+miscompiles it ([crbug.com/1484978](https://crbug.com/1484978)), so
+`pgt_load` always runs int8 models on the baseline kernel there, and you
+should not force `--flavor relaxed` on one. The full story, including the
+u7 activation trick behind the Arm speed, is in
+[docs/kernel-notes.md](docs/kernel-notes.md).
 
 ### What the wasm layer costs
 
@@ -204,16 +228,22 @@ plv8 call removes the penalty entirely), and int8 models spend a moment in
 
 ## Prerequisites
 
+You build the wasm kernels and convert model weights on your own machine
+(bring-your-own-weights); the database only ever receives data, never
+binaries. That is why a database project needs a local toolchain:
+
 - Python 3.11+
-- Rust with the wasm target: `rustup target add wasm32-unknown-unknown`
+- [Rust](https://www.rust-lang.org/) with the wasm target: install via
+  [rustup](https://rustup.rs), then `rustup target add wasm32-unknown-unknown`
 - A PostgreSQL with plv8 3.1+. No server nearby? `docker compose -f
   docker/compose.yml up -d` builds and starts one on localhost:5432.
 
 ## Quickstart
 
 ```sh
+git clone https://github.com/exatodigital-legacy/pg-transformers && cd pg-transformers
 pip install -e '.[export]'
-export PGT_DSN="host=... port=5432 user=... dbname=..."   # or --dsn per command
+export PGT_DSN="host=... port=5432 user=... dbname=..."   # connection string; or --dsn per command
 
 # 0. can your PostgreSQL run this? (ten seconds, works on any provider)
 pg-transformers probe
