@@ -108,35 +108,34 @@ On a laptop (Apple M5 Max performance core, plv8 3.2.4, v0.3.3 kernels):
 | `bge-m3` | 0.999999 | 2.4GB | 94 | 181 ms | 81 | 210 ms |
 | `bge-m3-int8` | 0.9965 | 0.79GB | 179 | 75 ms | 72 | 218 ms |
 
-On server cores (EC2, PostgreSQL + plv8 in Docker, single session; cells
-are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
-`pgt_load` auto-picks; "PG 14-17" is a real plv8 3.1.10 (V8 9.7). These
-rows were measured with the v0.3.2 kernels and have not yet been rerun
-on v0.3.3, which is 8-50% faster depending on model and flavor (see the
-laptop table):
+On server cores (EC2, PostgreSQL + plv8 in Docker, single session, v0.3.3
+kernels; cells are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with
+the flavor `pgt_load` auto-picks; "PG 14-17" is a real plv8 3.1.10 (V8 9.7):
 
 | Key | Graviton4 PG 18 | Graviton4 PG 14-17 | Xeon SPR PG 18 | Xeon SPR PG 14-17 |
 |---|---|---|---|---|
-| `all-minilm` | 962 · 19 ms | 875 · 21 ms | 873 · 18 ms | 758 · 21 ms |
-| `all-minilm-int8` | 1472 · 11 ms | 745 · 25 ms | 1001 · 13 ms | 983 · 14 ms |
-| `serafim-100m` | 137 · 131 ms | 123 · 151 ms | 122 · 141 ms | 109 · 163 ms |
-| `serafim-100m-int8` | 206 · 73 ms | 104 · 170 ms | 149 · 93 ms | 148 · 93 ms |
-| `bge-m3` | 40 · 461 ms | 36 · 507 ms | 33 · 454 ms | 29 · 526 ms |
-| `bge-m3-int8` | 65 · 235 ms | 31 · 550 ms | 44 · 298 ms | 44 · 301 ms |
+| `all-minilm` | 1308 · 17 ms | 1126 · 19 ms | 1192 · 18 ms | 988 · 21 ms |
+| `all-minilm-int8` | 2112 · 8 ms | 875 · 23 ms | 1377 · 13 ms | 1357 · 13 ms |
+| `serafim-100m` | 159 · 134 ms | 138 · 152 ms | 150 · 152 ms | 127 · 167 ms |
+| `serafim-100m-int8` | 314 · 48 ms | 117 · 152 ms | 196 · 82 ms | 194 · 83 ms |
+| `bge-m3` | 43 · 448 ms | 38 · 502 ms | 41 · 506 ms | 34 · 555 ms |
+| `bge-m3-int8` | 97 · 164 ms | 35 · 496 ms | 56 · 274 ms | 56 · 274 ms |
 
 (Graviton4 = c8g.2xlarge, Neoverse V2; Xeon SPR = c7i.2xlarge, Sapphire
 Rapids Platinum 8488C.)
 
-What the two tables say: on same-version kernels a server core runs
-2.0-2.4x slower than an M5 Max core, with Graviton4 and Sapphire Rapids
-within about 15% of each other on the paths they share. The int8 variants
+What the two tables say: on same-flavor kernels a server core runs
+2.0-2.4x slower than an M5 Max core, except the baseline int8 kernels on
+Sapphire Rapids, which come in at 1.3-1.5x (their `i32x4.dot_i16x8_s` inner
+loop lowers to pmaddwd, which x86 does relatively better than NEON; the
+same kernels run 1.5x faster on SPR than on Graviton). The int8 variants
 are the fastest option everywhere. On Arm, relaxed SIMD is where the int8
-speed lives (one SDOT per 16 columns; 2.5x the baseline kernel on
-v0.3.3), so PostgreSQL 18 is a real upgrade on Graviton. On x86 the int8
-models run the baseline kernel on every PostgreSQL version, so PG 14-17
-give up almost nothing there; PG 18 buys x86 only the fp32 FMA gain
-(~10%). plv8 3.1.10's older V8 costs about 5% versus the same baseline
-kernel on plv8 3.2.4.
+speed lives (one SDOT per 16 columns; 2.4-2.8x the baseline kernel), so
+PostgreSQL 18 is a real upgrade on Graviton. On x86 the int8 models run
+the baseline kernel on every PostgreSQL version, so PG 14-17 give up
+almost nothing there; PG 18 buys x86 only the fp32 FMA gain (~20%). plv8
+3.1.10's older V8 costs 1-2% versus the same baseline kernel on plv8
+3.2.4 (the x86 int8 columns).
 
 Why int8 ignores relaxed SIMD on x86: the V8 in plv8 3.2.x (11.5) lowers
 the relaxed int8 dot to a 5-instruction sequence on all x86 (VNNI support
@@ -155,20 +154,22 @@ and much faster.
 Same models, same protocol, same machines, outside the database
 (`bench/node_wasm.js` runs the identical wasm blobs in Node 22;
 `bench/native_cpu.py` runs the fastest CPU-only native paths, single
-thread). serafim-100m shown, v0.3.2 kernels; tokens/s:
+thread). serafim-100m shown; tokens/s:
 
 | Runtime (single core) | Graviton4 fp32 | Graviton4 int8 | Xeon SPR fp32 | Xeon SPR int8 |
 |---|---|---|---|---|
-| in-database (plv8 3.2.4) | 137 | 206 | 122 | 149 |
-| same wasm, Node 22 | 151 | 218 | 151 | 181 |
-| native, PyTorch fp32 | 927 | - | 841 | - |
-| native, ONNX Runtime int8 | - | 894 | - | 2504 |
+| in-database (plv8 3.2.4) | 159 | 314 | 150 | 196 |
+| same wasm, Node 22 | 196 | 329 | 189 | 203 |
+| native, PyTorch fp32 | 893 | - | 728 | - |
+| native, ONNX Runtime int8 | - | 944 | - | 2239 |
 
-Two conclusions. The database layer is nearly free: plv8 runs the wasm
-within 5% of Node on Arm (the larger x86 gap is Node's newer V8, 12.4 vs
-11.5, not PostgreSQL). The real cost is wasm itself: 128-bit SIMD and no
-native int8 GEMM put it at 5-7x slower than native fp32, and further from
-native int8 where VNNI applies (SPR). That is the price of the convenience
+Two conclusions. The database layer is nearly free on the int8 kernels:
+plv8 runs them within 5% of Node. The fp32 kernels run about 20% slower
+under plv8 than Node, which is V8 codegen on the FMA-heavy relaxed path
+(11.5 vs 12.4), not PostgreSQL overhead. The real cost is wasm itself:
+128-bit SIMD and no native int8 GEMM put it at 4-5x slower than native
+fp32, and 3x (Arm) to 11x (SPR, where VNNI applies) slower than native
+int8. That is the price of the convenience
 this project exists for: running on a managed database with no native
 extensions and no infrastructure beside it. In practice it matters less
 than it looks: queries (the latency-critical path) are still tens of
