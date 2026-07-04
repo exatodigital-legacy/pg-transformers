@@ -1,0 +1,60 @@
+# Builds the PostgreSQL 16 + plv8 3.1.10 image (V8 9.7, what AWS RDS/Aurora
+# run on PG 14-17) and pushes it to GHCR, so benchmark reruns can pull it
+# (~30s) instead of compiling V8 from source (~40min per architecture).
+name: build-image-31
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [docker/Dockerfile.plv31]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/exatodigital-legacy/postgres-plv8
+  TAG: 16-3.1.10
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile.plv31
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.arch }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" \
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"

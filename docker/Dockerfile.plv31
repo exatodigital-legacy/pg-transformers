@@ -1,0 +1,16 @@
+# PostgreSQL 16 + plv8 3.1.10 (V8 9.7) built from source, for the
+# "PG 14-17" benchmark rows. plv8 3.1.x builds V8 itself: needs wget,
+# xz (LLVM 13 tarball), and bullseye's real libtinfo5 for the prebuilt
+# clang (a libtinfo6 symlink lacks the versioned NCURSES_TINFO symbols).
+FROM postgres:16-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential git ca-certificates pkg-config cmake ninja-build \
+      postgresql-server-dev-16 libtinfo6 python3 wget curl xz-utils \
+    && curl -fsSL -o /tmp/libtinfo5.deb "http://deb.debian.org/debian/pool/main/n/ncurses/libtinfo5_6.4-4_$(dpkg --print-architecture).deb" \
+    && dpkg -i /tmp/libtinfo5.deb && rm /tmp/libtinfo5.deb \
+    && git clone --depth 1 --branch v3.1.10 https://github.com/plv8/plv8.git /tmp/plv8 \
+    && cd /tmp/plv8 && make && make install \
+    && rm -rf /tmp/plv8 \
+    && apt-get purge -y build-essential git cmake ninja-build && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
