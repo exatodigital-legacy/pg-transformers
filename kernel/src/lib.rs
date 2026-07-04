@@ -5,7 +5,7 @@
 #![no_std]
 #![allow(static_mut_refs)]
 use core::arch::wasm32::*;
-use libm::{erff, expf, sqrtf};
+use libm::sqrtf;
 
 // fused multiply-add when built with +relaxed-simd (feature-detect at load
 // time and pick the kernel; V8 11.4+ supports it), else mul+add
@@ -61,7 +61,9 @@ static mut VA: [f32; MAXN * H] = [0.0; MAXN * H];
 static mut ATT: [f32; MAXN * H] = [0.0; MAXN * H];
 static mut PROJ: [f32; MAXN * H] = [0.0; MAXN * H];
 static mut FFN1: [f32; MAXN * I] = [0.0; MAXN * I];
-static mut SCORES: [f32; MAXN] = [0.0; MAXN];
+// +3 so the vectorized softmax can always run whole 4-lane chunks; the
+// spill lanes hold garbage that is never summed or read back
+static mut SCORES: [f32; MAXN + 3] = [0.0; MAXN + 3];
 static mut OUT: [f32; H] = [0.0; H];
 
 // int8 builds quantize the input rows of every linear to asymmetric u8
@@ -190,22 +192,49 @@ unsafe fn dot(a: *const f32, b: *const f32, k: usize) -> f32 {
         + f32x4_extract_lane::<2>(s) + f32x4_extract_lane::<3>(s)
 }
 
+/// Tokens per L1-resident activation panel: the j-loop re-reads the same
+/// panel for every output row, so it must stay cached across the whole
+/// weight sweep. ~32KB of activations (plus the streaming weight rows)
+/// fits every target L1 (48KB Intel, 64KB Zen/Neoverse, 128KB Apple).
+/// Multiple of 4 to match the register tile; at least 4, at most 64.
+const fn panel_tokens(din_bytes: usize) -> usize {
+    let t = (32 * 1024 / din_bytes) & !3;
+    if t < 4 { 4 } else if t > 64 { 64 } else { t }
+}
+
 unsafe fn linear(x: *const f32, w_off: usize, b_off: usize, y: *mut f32,
                  n: usize, din: usize, dout: usize) {
     let wp = W.as_ptr().add(w_off);
     let bp = W.as_ptr().add(b_off);
-    // register-block 2 output rows x 4 tokens: each weight load is reused
-    // across 4 tokens and each activation load across 2 rows (0.75 loads per
-    // madd vs 2 unblocked) - the kernel is bound by loads, not compute. Each
+    // Token-panel blocking: sweep all dout weight rows over one L1-resident
+    // panel of tokens at a time, so activations are read from memory once
+    // per linear and the streamed side is the weights (n/panel passes),
+    // not activations x dout/2 passes. Within a panel, register-block
+    // 2 output rows x 4 tokens: each weight load is reused across 4 tokens
+    // and each activation load across 2 rows (0.75 loads per madd vs 2
+    // unblocked) - the kernel is bound by loads, not compute. Each
     // (row,token) pair accumulates in its own single chain, in weight order,
-    // so results do not depend on the blocking.
+    // so results do not depend on either level of blocking.
+    let tp = panel_tokens(din * 4);
+    let mut t0 = 0;
+    while t0 < n {
+        let t1 = if t0 + tp <= n { t0 + tp } else { n };
+        linear_panel(x, wp, bp, y, t0, t1, din, dout);
+        t0 = t1;
+    }
+}
+
+#[inline]
+unsafe fn linear_panel(x: *const f32, wp: *const f32, bp: *const f32,
+                       y: *mut f32, t0: usize, t1: usize,
+                       din: usize, dout: usize) {
     let mut j = 0;
     while j + 2 <= dout {
         let wj0 = wp.add(j * din);
         let wj1 = wp.add((j + 1) * din);
         let (bj0, bj1) = (*bp.add(j), *bp.add(j + 1));
-        let mut t = 0;
-        while t + 4 <= n {
+        let mut t = t0;
+        while t + 4 <= t1 {
             let (x0, x1, x2, x3) = (x.add(t * din), x.add((t + 1) * din),
                                     x.add((t + 2) * din), x.add((t + 3) * din));
             let mut a00 = f32x4_splat(0.0); let mut a01 = f32x4_splat(0.0);
@@ -237,7 +266,7 @@ unsafe fn linear(x: *const f32, w_off: usize, b_off: usize, y: *mut f32,
             *y.add((t + 3) * dout + j + 1) = bj1 + hsum(a31);
             t += 4;
         }
-        while t < n {
+        while t < t1 {
             *y.add(t * dout + j) = bj0 + dot(x.add(t * din), wj0, din);
             *y.add(t * dout + j + 1) = bj1 + dot(x.add(t * din), wj1, din);
             t += 1;
@@ -248,7 +277,7 @@ unsafe fn linear(x: *const f32, w_off: usize, b_off: usize, y: *mut f32,
         // dout is a multiple of 16 for every registered model; kept for safety
         let wj = wp.add(j * din);
         let bj = *bp.add(j);
-        for t in 0..n {
+        for t in t0..t1 {
             *y.add(t * dout + j) = bj + dot(x.add(t * din), wj, din);
         }
         j += 1;
@@ -382,20 +411,43 @@ unsafe fn dot_q8(a: *const u8, w: *const i8, cs: *const f32, cm: *const f32,
 /// depend on the register blocking.
 unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
                     y: *mut f32, n: usize, din: usize, dout: usize) {
-    let nb = din / BQ;
-    let xq = XQ.0.as_ptr();
-    let asc = ASCALE.as_ptr();
-    let amn = AMIN.as_ptr();
     let wp = QW.0.as_ptr().add(w_off);
     let rp = RSUM.as_ptr().add(rs_off);
     let sp = W.as_ptr().add(s_off);
     let bp = W.as_ptr().add(b_off);
+    // token-panel blocking exactly as in linear(): the quantized panel
+    // (1 byte per element) stays L1-resident across the full weight sweep
+    let tp = panel_tokens(din);
+    let mut t0 = 0;
+    while t0 < n {
+        let t1 = if t0 + tp <= n { t0 + tp } else { n };
+        linear_q8_panel(wp, rp, sp, bp, y, t0, t1, din, dout);
+        t0 = t1;
+    }
+}
+
+#[inline]
+unsafe fn linear_q8_panel(wp: *const i8, rp: *const f32, sp: *const f32,
+                          bp: *const f32, y: *mut f32, t0: usize, t1: usize,
+                          din: usize, dout: usize) {
+    let nb = din / BQ;
+    let xq = XQ.0.as_ptr();
+    let asc = ASCALE.as_ptr();
+    let amn = AMIN.as_ptr();
     // xmin_b * rowsum_b summed over blocks, one token row against one
-    // weight row: a tiny nb-long dot product
+    // weight row: a tiny nb-long dot product, 4 lanes at a time (nb can be
+    // as small as 3, so the scalar tail may be the whole loop)
     #[inline(always)]
     unsafe fn mincorr(cm: *const f32, rs: *const f32, nb: usize) -> f32 {
-        let mut s = 0.0f32;
-        for b in 0..nb { s += *cm.add(b) * *rs.add(b); }
+        let mut acc = f32x4_splat(0.0);
+        let mut b = 0;
+        while b + 4 <= nb {
+            acc = madd(v128_load(cm.add(b) as *const v128),
+                       v128_load(rs.add(b) as *const v128), acc);
+            b += 4;
+        }
+        let mut s = hsum(acc);
+        while b < nb { s += *cm.add(b) * *rs.add(b); b += 1; }
         s
     }
     let mut j = 0;
@@ -405,8 +457,8 @@ unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
         let (sj0, sj1) = (*sp.add(j), *sp.add(j + 1));
         let (bj0, bj1) = (*bp.add(j), *bp.add(j + 1));
         let (rj0, rj1) = (rp.add(j * nb), rp.add((j + 1) * nb));
-        let mut t = 0;
-        while t + 4 <= n {
+        let mut t = t0;
+        while t + 4 <= t1 {
             let (x0, x1, x2, x3) = (xq.add(t * din), xq.add((t + 1) * din),
                                     xq.add((t + 2) * din), xq.add((t + 3) * din));
             let mut y00 = f32x4_splat(0.0); let mut y01 = f32x4_splat(0.0);
@@ -503,7 +555,7 @@ unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
                 bj1 + sj1 * (hsum(y31) + mincorr(amn.add((t + 3) * nb), rj1, nb));
             t += 4;
         }
-        while t < n {
+        while t < t1 {
             let (cst, cmt) = (asc.add(t * nb), amn.add(t * nb));
             *y.add(t * dout + j) =
                 bj0 + sj0 * dot_q8(xq.add(t * din), wj0, cst, cmt, rj0, nb);
@@ -518,7 +570,7 @@ unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
         let wj = wp.add(j * din);
         let (sj, bj) = (*sp.add(j), *bp.add(j));
         let rj = rp.add(j * nb);
-        for t in 0..n {
+        for t in t0..t1 {
             *y.add(t * dout + j) = bj + sj * dot_q8(
                 xq.add(t * din), wj, asc.add(t * nb), amn.add(t * nb), rj, nb);
         }
@@ -526,16 +578,40 @@ unsafe fn linear_q8(w_off: usize, rs_off: usize, s_off: usize, b_off: usize,
     }
 }
 
+/// LayerNorm one row of H (H is a multiple of 16), 4 lanes at a time:
+/// mean and variance with 4 parallel accumulator chains each, then the
+/// affine pass fused over the row.
 unsafe fn ln_row(row: *mut f32, g_off: usize, b_off: usize) {
-    let mut m = 0.0f32;
-    for d in 0..H { m += *row.add(d); }
-    m /= H as f32;
-    let mut v = 0.0f32;
-    for d in 0..H { let z = *row.add(d) - m; v += z * z; }
-    v /= H as f32;
-    let inv = 1.0 / sqrtf(v + LN_EPS);
-    for d in 0..H {
-        *row.add(d) = (*row.add(d) - m) * inv * W[g_off + d] + W[b_off + d];
+    let mut s0 = f32x4_splat(0.0);
+    let mut s1 = f32x4_splat(0.0);
+    let mut d = 0;
+    while d < H {
+        s0 = f32x4_add(s0, v128_load(row.add(d) as *const v128));
+        s1 = f32x4_add(s1, v128_load(row.add(d + 4) as *const v128));
+        d += 8;
+    }
+    let m = hsum(f32x4_add(s0, s1)) / H as f32;
+    let mv = f32x4_splat(m);
+    let mut v0 = f32x4_splat(0.0);
+    let mut v1 = f32x4_splat(0.0);
+    d = 0;
+    while d < H {
+        let z0 = f32x4_sub(v128_load(row.add(d) as *const v128), mv);
+        let z1 = f32x4_sub(v128_load(row.add(d + 4) as *const v128), mv);
+        v0 = madd(z0, z0, v0);
+        v1 = madd(z1, z1, v1);
+        d += 8;
+    }
+    let var = hsum(f32x4_add(v0, v1)) / H as f32;
+    let iv = f32x4_splat(1.0 / sqrtf(var + LN_EPS));
+    let (gp, bp) = (W.as_ptr().add(g_off), W.as_ptr().add(b_off));
+    d = 0;
+    while d < H {
+        let z = f32x4_mul(f32x4_sub(v128_load(row.add(d) as *const v128), mv), iv);
+        v128_store(row.add(d) as *mut v128,
+                   madd(z, v128_load(gp.add(d) as *const v128),
+                        v128_load(bp.add(d) as *const v128)));
+        d += 4;
     }
 }
 
@@ -543,7 +619,13 @@ unsafe fn add_residual_ln(res: *mut f32, g_off: usize, b_off: usize, n: usize) {
     for t in 0..n {
         let xr = res.add(t * H);
         let pr = PROJ.as_ptr().add(t * H);
-        for d in 0..H { *xr.add(d) += *pr.add(d); }
+        let mut d = 0;
+        while d < H {
+            v128_store(xr.add(d) as *mut v128,
+                       f32x4_add(v128_load(xr.add(d) as *const v128),
+                                 v128_load(pr.add(d) as *const v128)));
+            d += 4;
+        }
         ln_row(xr, g_off, b_off);
     }
 }
@@ -560,12 +642,18 @@ unsafe fn attention(n: usize) {
                 SCORES[s] = v;
                 if v > mx { mx = v; }
             }
-            let mut sum = 0.0f32;
-            for s in 0..n {
-                let e = expf(SCORES[s] - mx);
-                SCORES[s] = e;
-                sum += e;
+            // exp in 4-lane chunks (SCORES has 3 spill lanes past MAXN;
+            // lanes at n.. hold garbage and are never summed or read)
+            let mv = f32x4_splat(mx);
+            let mut s4 = 0;
+            while s4 < n {
+                let sp = SCORES.as_mut_ptr().add(s4);
+                v128_store(sp as *mut v128,
+                           exp_f32x4(f32x4_sub(v128_load(sp as *const v128), mv)));
+                s4 += 4;
             }
+            let mut sum = 0.0f32;
+            for s in 0..n { sum += SCORES[s]; }
             let inv = 1.0 / sum;
             let mut acc = [f32x4_splat(0.0); DH / 4];
             for s in 0..n {
@@ -583,9 +671,148 @@ unsafe fn attention(n: usize) {
     }
 }
 
-#[inline]
-fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + erff(x * core::f32::consts::FRAC_1_SQRT_2))
+/// Vectorized exp, the Cephes-style algorithm as tuned in Eigen
+/// (pexp_float, ~1 ulp): x = m*ln2 + r with m = rint(x/ln2), exp(r) by a
+/// 6th-order minimax polynomial on [-ln2/2, ln2/2], then y * 2^m with the
+/// power of two built from the exponent bits, split two ways so subnormal
+/// results still round correctly. Inputs are clamped to [-104, 88.7], so
+/// any finite input gives a finite result.
+#[inline(always)]
+unsafe fn exp_f32x4(x0: v128) -> v128 {
+    let x = f32x4_pmin(f32x4_pmax(x0, f32x4_splat(-104.0)), f32x4_splat(88.723));
+    let m = f32x4_nearest(f32x4_mul(x, f32x4_splat(core::f32::consts::LOG2_E)));
+    // r = x - m*ln2, ln2 split in two so the subtraction stays exact
+    let mut r = madd(m, f32x4_splat(-0.693359375), x);
+    r = madd(m, f32x4_splat(2.12194440e-4), r);
+    let r2 = f32x4_mul(r, r);
+    let mut p_even = madd(r2, f32x4_splat(1.37449637986719608306884765625e-3),
+                          f32x4_splat(4.166965186595916748046875e-2));
+    let p_odd = madd(r2, f32x4_splat(8.36894474923610687255859375e-3),
+                     f32x4_splat(0.16666518151760101318359375));
+    p_even = madd(r2, p_even, f32x4_splat(0.49999988079071044921875));
+    let p_low = f32x4_add(r, f32x4_splat(1.0));
+    let mut y = madd(r, p_odd, p_even);
+    y = madd(r2, y, p_low);
+    // 2^m = 2^(m/2 rounded) * 2^(rest): bias each half by 127 and shift
+    // into the exponent field
+    let biased = i32x4_add(i32x4_trunc_sat_f32x4(m), i32x4_splat(254));
+    let hi = u32x4_shr(biased, 1);
+    let lo = i32x4_sub(biased, hi);
+    f32x4_mul(f32x4_mul(y, i32x4_shl(hi, 23)), i32x4_shl(lo, 23))
+}
+
+/// Vectorized erf, the 11/10-degree rational interpolant from Eigen
+/// (generic_fast_erf<float>, 3 ulp on normalized floats): erf(x) =
+/// clamp(x * P5(x^2) / Q5(x^2), -1, 1) with x^2 clamped to 16 so the
+/// rational stays finite where erf has already saturated in f32.
+#[inline(always)]
+unsafe fn erf_f32x4(x: v128) -> v128 {
+    // numerator coefficients (odd polynomial), highest degree first
+    const A: [f32; 6] = [
+        2.123732201653183437883853912353515625e-06,
+        2.861979592125862836837768554687500000e-04,
+        3.658048342913389205932617187500000000e-03,
+        5.243302136659622192382812500000000000e-02,
+        1.874160766601562500000000000000000000e-01,
+        1.128379106521606445312500000000000000e+00,
+    ];
+    // denominator coefficients (even polynomial), highest degree first
+    const B: [f32; 6] = [
+        3.89185734093189239501953125000e-05,
+        1.14329601638019084930419921875e-03,
+        1.47520881146192550659179687500e-02,
+        1.12945675849914550781250000000e-01,
+        4.99425798654556274414062500000e-01,
+        1.0,
+    ];
+    let x2 = f32x4_pmin(f32x4_splat(16.0), f32x4_mul(x, x));
+    let mut p = f32x4_splat(A[0]);
+    p = madd(x2, p, f32x4_splat(A[1]));
+    p = madd(x2, p, f32x4_splat(A[2]));
+    p = madd(x2, p, f32x4_splat(A[3]));
+    p = madd(x2, p, f32x4_splat(A[4]));
+    p = madd(x2, p, f32x4_splat(A[5]));
+    p = f32x4_mul(x, p);
+    let mut q = f32x4_splat(B[0]);
+    q = madd(x2, q, f32x4_splat(B[1]));
+    q = madd(x2, q, f32x4_splat(B[2]));
+    q = madd(x2, q, f32x4_splat(B[3]));
+    q = madd(x2, q, f32x4_splat(B[4]));
+    q = madd(x2, q, f32x4_splat(B[5]));
+    let r = f32x4_div(p, q);
+    f32x4_pmax(f32x4_pmin(r, f32x4_splat(1.0)), f32x4_splat(-1.0))
+}
+
+/// Same rational, evaluated in f64 two lanes at a time. Without FMA the
+/// f32 evaluation is a shade too loose for the int8 models: the ~1e-7
+/// wobble flips activation-quantization roundings and the flips compound
+/// over deep models (measured as worst-case cosine 0.9958 vs 0.9968 on
+/// bge-m3-int8). f64 arithmetic puts the rational within half an ulp of
+/// its true value, tighter than scalar libm, at about a quarter of its
+/// cost. Only the int8 baseline kernel needs this; relaxed builds get the
+/// same tightness from FMA.
+#[cfg(not(target_feature = "relaxed-simd"))]
+#[inline(always)]
+unsafe fn erf_f32x4_f64(x: v128) -> v128 {
+    const A: [f64; 6] = [
+        2.123732201653183437883853912353515625e-06,
+        2.861979592125862836837768554687500000e-04,
+        3.658048342913389205932617187500000000e-03,
+        5.243302136659622192382812500000000000e-02,
+        1.874160766601562500000000000000000000e-01,
+        1.128379106521606445312500000000000000e+00,
+    ];
+    const B: [f64; 6] = [
+        3.89185734093189239501953125000e-05,
+        1.14329601638019084930419921875e-03,
+        1.47520881146192550659179687500e-02,
+        1.12945675849914550781250000000e-01,
+        4.99425798654556274414062500000e-01,
+        1.0,
+    ];
+    #[inline(always)]
+    unsafe fn half(xd: v128) -> v128 {
+        let x2 = f64x2_pmin(f64x2_splat(16.0), f64x2_mul(xd, xd));
+        let mut p = f64x2_splat(A[0]);
+        let mut q = f64x2_splat(B[0]);
+        p = f64x2_add(f64x2_mul(x2, p), f64x2_splat(A[1]));
+        q = f64x2_add(f64x2_mul(x2, q), f64x2_splat(B[1]));
+        p = f64x2_add(f64x2_mul(x2, p), f64x2_splat(A[2]));
+        q = f64x2_add(f64x2_mul(x2, q), f64x2_splat(B[2]));
+        p = f64x2_add(f64x2_mul(x2, p), f64x2_splat(A[3]));
+        q = f64x2_add(f64x2_mul(x2, q), f64x2_splat(B[3]));
+        p = f64x2_add(f64x2_mul(x2, p), f64x2_splat(A[4]));
+        q = f64x2_add(f64x2_mul(x2, q), f64x2_splat(B[4]));
+        p = f64x2_add(f64x2_mul(x2, p), f64x2_splat(A[5]));
+        q = f64x2_add(f64x2_mul(x2, q), f64x2_splat(B[5]));
+        f64x2_div(f64x2_mul(xd, p), q)
+    }
+    let lo = f32x4_demote_f64x2_zero(half(f64x2_promote_low_f32x4(x)));
+    let hi = f32x4_demote_f64x2_zero(half(f64x2_promote_low_f32x4(
+        i8x16_shuffle::<8, 9, 10, 11, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15>(x, x))));
+    let r = i8x16_shuffle::<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(lo, hi);
+    f32x4_pmax(f32x4_pmin(r, f32x4_splat(1.0)), f32x4_splat(-1.0))
+}
+
+/// gelu over a buffer, 4 lanes at a time: 0.5*x*(1+erf(x/sqrt(2))).
+/// n4 must be a multiple of 4 (n*I always is). int8 baseline builds use
+/// the f64 erf (see above); everything else the f32 one.
+unsafe fn gelu_rows(x: *mut f32, n4: usize) {
+    let c = f32x4_splat(core::f32::consts::FRAC_1_SQRT_2);
+    let half = f32x4_splat(0.5);
+    let one = f32x4_splat(1.0);
+    let mut i = 0;
+    while i < n4 {
+        let v = v128_load(x.add(i) as *const v128);
+        #[cfg(not(target_feature = "relaxed-simd"))]
+        let e = if QUANT_INT8 { erf_f32x4_f64(f32x4_mul(v, c)) }
+                else { erf_f32x4(f32x4_mul(v, c)) };
+        #[cfg(target_feature = "relaxed-simd")]
+        let e = erf_f32x4(f32x4_mul(v, c));
+        v128_store(x.add(i) as *mut v128,
+                   f32x4_mul(f32x4_mul(half, v), f32x4_add(one, e)));
+        i += 4;
+    }
 }
 
 struct Cur(usize);
@@ -665,7 +892,7 @@ pub extern "C" fn forward(n_tokens: i32) {
 
                 quant_rows(X.as_ptr(), n, H);
                 linear_q8(fiw, fir, fis, fib, FFN1.as_mut_ptr(), n, H, I);
-                for i in 0..n * I { FFN1[i] = gelu(FFN1[i]); }
+                gelu_rows(FFN1.as_mut_ptr(), n * I);
                 quant_rows(FFN1.as_ptr(), n, I);
                 linear_q8(fow, fo_r, fos, fob, PROJ.as_mut_ptr(), n, I, H);
                 add_residual_ln(X.as_mut_ptr(), fg, fb, n);
@@ -687,7 +914,7 @@ pub extern "C" fn forward(n_tokens: i32) {
                 add_residual_ln(X.as_mut_ptr(), ag, ab, n);
 
                 linear(X.as_ptr(), fiw, fib, FFN1.as_mut_ptr(), n, H, I);
-                for i in 0..n * I { FFN1[i] = gelu(FFN1[i]); }
+                gelu_rows(FFN1.as_mut_ptr(), n * I);
                 linear(FFN1.as_ptr(), fow, fob, PROJ.as_mut_ptr(), n, I, H);
                 add_residual_ln(X.as_mut_ptr(), fg, fb, n);
             }
