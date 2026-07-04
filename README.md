@@ -26,7 +26,7 @@ ligatures). `pg-transformers verify` reruns that proof against your database.
 Each model also has an int8 variant that trades exact parity (cosine still
 at or above 0.996) for a 3x smaller memory footprint and the highest
 throughput of the set; on Arm cores with relaxed SIMD (plv8 3.2.x;
-PostgreSQL 18 on AWS) the gap over fp32 reaches 1.5-1.6x.
+PostgreSQL 18 on AWS) the gap over fp32 reaches 1.8-2x.
 
 ## Models
 
@@ -73,20 +73,23 @@ the baseline SIMD kernels. `pgt_load` picks per session: relaxed when the
 V8 supports it, except for int8 models on x86, which run the baseline
 kernel everywhere (see below). The load message says which one you got.
 
-On a laptop (Apple M5 Max performance core, plv8 3.2.4):
+On a laptop (Apple M5 Max performance core, plv8 3.2.4, v0.3.3 kernels):
 
 | Key | Cosine (worst) | RAM | relaxed: tok/s | query | baseline: tok/s | query |
 |---|---|---|---|---|---|---|
-| `all-minilm` | 0.999999 | 0.24GB | 2237 | 8.6 ms | 1945 | 9.9 ms |
-| `all-minilm-int8` | 0.9964 | 0.11GB | 3452 | 5.1 ms | 1786 | 10.6 ms |
-| `serafim-100m` | 0.999999 | 0.60GB | 284 | 60 ms | 250 | 69 ms |
-| `serafim-100m-int8` | 0.9987 | 0.29GB | 433 | 33 ms | 231 | 74 ms |
-| `bge-m3` | 0.999999 | 2.4GB | 80 | 216 ms | 68 | 249 ms |
-| `bge-m3-int8` | 0.9967 | 0.79GB | 130 | 106 ms | 67 | 243 ms |
+| `all-minilm` | 0.999999 | 0.24GB | 2778 | 7.1 ms | 2302 | 8.6 ms |
+| `all-minilm-int8` | 0.9964 | 0.11GB | 4982 | 3.6 ms | 2017 | 9.6 ms |
+| `serafim-100m` | 0.999999 | 0.60GB | 330 | 52 ms | 284 | 61 ms |
+| `serafim-100m-int8` | 0.9989 | 0.29GB | 645 | 21 ms | 258 | 66 ms |
+| `bge-m3` | 0.999999 | 2.4GB | 94 | 181 ms | 81 | 210 ms |
+| `bge-m3-int8` | 0.9965 | 0.79GB | 179 | 75 ms | 72 | 218 ms |
 
 On server cores (EC2, PostgreSQL + plv8 in Docker, single session; cells
 are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
-`pgt_load` auto-picks; "PG 14-17" is a real plv8 3.1.10 (V8 9.7):
+`pgt_load` auto-picks; "PG 14-17" is a real plv8 3.1.10 (V8 9.7). These
+rows were measured with the v0.3.2 kernels and have not yet been rerun
+on v0.3.3, which is 8-50% faster depending on model and flavor (see the
+laptop table):
 
 | Key | Graviton4 PG 18 | Graviton4 PG 14-17 | Xeon SPR PG 18 | Xeon SPR PG 14-17 |
 |---|---|---|---|---|
@@ -100,15 +103,16 @@ are tokens/s and ms per query). "PG 18" is plv8 3.2.4 with the flavor
 (Graviton4 = c8g.2xlarge, Neoverse V2; Xeon SPR = c7i.2xlarge, Sapphire
 Rapids Platinum 8488C.)
 
-What the two tables say: a server core runs these kernels 2.0-2.4x slower
-than an M5 Max core, with Graviton4 and Sapphire Rapids within about 15% of
-each other on the paths they share. The int8 variants are the fastest
-option everywhere. On Arm, relaxed SIMD is where the int8 speed lives (one
-SDOT per 16 columns; about 2x the baseline kernel), so PostgreSQL 18 is a
-real upgrade on Graviton. On x86 the int8 models run the baseline kernel
-on every PostgreSQL version, so PG 14-17 give up almost nothing there; PG
-18 buys x86 only the fp32 FMA gain (~10%). plv8 3.1.10's older V8 costs
-about 5% versus the same baseline kernel on plv8 3.2.4.
+What the two tables say: on same-version kernels a server core runs
+2.0-2.4x slower than an M5 Max core, with Graviton4 and Sapphire Rapids
+within about 15% of each other on the paths they share. The int8 variants
+are the fastest option everywhere. On Arm, relaxed SIMD is where the int8
+speed lives (one SDOT per 16 columns; 2.5x the baseline kernel on
+v0.3.3), so PostgreSQL 18 is a real upgrade on Graviton. On x86 the int8
+models run the baseline kernel on every PostgreSQL version, so PG 14-17
+give up almost nothing there; PG 18 buys x86 only the fp32 FMA gain
+(~10%). plv8 3.1.10's older V8 costs about 5% versus the same baseline
+kernel on plv8 3.2.4.
 
 Why int8 ignores relaxed SIMD on x86: the V8 in plv8 3.2.x (11.5) lowers
 the relaxed int8 dot to a 5-instruction sequence on all x86 (VNNI support
@@ -127,7 +131,7 @@ and much faster.
 Same models, same protocol, same machines, outside the database
 (`bench/node_wasm.js` runs the identical wasm blobs in Node 22;
 `bench/native_cpu.py` runs the fastest CPU-only native paths, single
-thread). serafim-100m shown; tokens/s:
+thread). serafim-100m shown, v0.3.2 kernels; tokens/s:
 
 | Runtime (single core) | Graviton4 fp32 | Graviton4 int8 | Xeon SPR fp32 | Xeon SPR int8 |
 |---|---|---|---|---|
