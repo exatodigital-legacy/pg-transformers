@@ -96,7 +96,8 @@ this repository contains no model weights.
 In-DB, single core (one PostgreSQL backend), measured by `pg-transformers
 verify` on its reference corpus, after warmup. Throughput is tokens
 embedded per second on full-length documents (512 tokens; 256 for
-all-minilm, its maximum). Query latency is the end-to-end time to embed
+all-minilm and 128 for multilingual-minilm, their maxima). Query latency
+is the end-to-end time to embed
 one short query (10-30 tokens), the interactive path. Cosine is the worst
 case against the PyTorch original over the corpus. RAM is the measured
 PostgreSQL backend RSS after loading the model and embedding (weights +
@@ -116,6 +117,12 @@ On a laptop (Apple M5 Max performance core, plv8 3.2.4, v0.3.3 kernels):
 | `all-minilm-int8` | 0.9964 | 0.11GB | 4982 | 3.6 ms | 2017 | 9.6 ms |
 | `serafim-100m` | 0.999999 | 0.60GB | 330 | 52 ms | 284 | 61 ms |
 | `serafim-100m-int8` | 0.9989 | 0.29GB | 645 | 21 ms | 258 | 66 ms |
+| `multilingual-minilm` | 0.999999 | 0.72GB | 1478 | 12.7 ms | 1233 | 14.9 ms |
+| `multilingual-minilm-int8` | 0.9991 | 0.37GB | 2869 | 6.2 ms | 1061 | 16.7 ms |
+| `multilingual-e5-small` | 0.999999 | 0.74GB | 1044 | 13.6 ms | 962 | 15.0 ms |
+| `multilingual-e5-small-int8` | 0.9995 | 0.38GB | 1702 | 6.3 ms | 843 | 16.7 ms |
+| `serafim-335m` | 0.999999 | 1.5GB | 93 | 190 ms | 77 | 233 ms |
+| `serafim-335m-int8` | 0.9992 | 0.56GB | 190 | 73 ms | 71 | 232 ms |
 | `bge-m3` | 0.999999 | 2.4GB | 94 | 181 ms | 81 | 210 ms |
 | `bge-m3-int8` | 0.9965 | 0.79GB | 179 | 75 ms | 72 | 218 ms |
 

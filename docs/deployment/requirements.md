@@ -24,6 +24,9 @@ PostgreSQL has these, it runs, whoever hosts it:
    backend RSS: weights + tokenizer data + activations):
    - all-minilm: ~0.24GB (int8 variant ~0.11GB)
    - serafim-100m: ~0.60GB (int8 ~0.29GB)
+   - multilingual-minilm: ~0.72GB (int8 ~0.37GB)
+   - multilingual-e5-small: ~0.74GB (int8 ~0.38GB)
+   - serafim-335m: ~1.5GB (int8 ~0.56GB)
    - bge-m3: ~2.4GB (int8 ~0.79GB)
 4. **Long-lived sessions.** Weights load once per connection (sub-second for
    small models, a few seconds for bge-m3) and are cached in `globalThis`.

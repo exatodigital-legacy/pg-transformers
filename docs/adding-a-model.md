@@ -76,5 +76,6 @@ artifacts when they are present.
 Per-session memory is roughly the f32 weight bytes plus activations and
 tokenizer data: `4 * (vocab_size * hidden + layers * (12 * hidden^2 + ...))`.
 Measured RSS reference points: 22M params = ~0.24GB, 100M = ~0.60GB,
-568M = ~2.4GB; int8 variants ~0.11/0.29/0.79GB. Check the target's memory
+118M with a 250k vocab = ~0.73GB, 335M = ~1.5GB, 568M = ~2.4GB; int8
+variants ~0.11/0.29/0.37/0.56/0.79GB. Check the target's memory
 with `sql/probe.sql` before porting something big.
