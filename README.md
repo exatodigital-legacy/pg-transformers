@@ -30,12 +30,15 @@ PostgreSQL 18 on AWS) the gap over fp32 reaches 1.8-2x.
 
 ## Models
 
-All three registered models are ported and verified end to end in-DB:
+All six registered models are ported and verified end to end in-DB:
 
 | Key | Base model | Params | Dim | Languages | License | Tokenizer parity | Cosine vs PyTorch |
 |---|---|---|---|---|---|---|---|
 | `all-minilm` | [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) | 22M | 384 | English | Apache-2.0 | exact (76/76) | 1.000000 |
 | `serafim-100m` | [serafim-100m-ir](https://huggingface.co/PORTULAN/serafim-100m-portuguese-pt-sentence-encoder-ir) | 100M | 768 | Portuguese | MIT | exact (76/76) | 1.000000 |
+| `multilingual-minilm` | [paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) | 118M | 384 | 50+ | Apache-2.0 | exact (76/76) | 1.000000 |
+| `multilingual-e5-small` | [multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small) | 118M | 384 | 94 | MIT | exact (76/76) | 1.000000 |
+| `serafim-335m` | [serafim-335m-ir](https://huggingface.co/PORTULAN/serafim-335m-portuguese-pt-sentence-encoder-ir) | 335M | 1024 | Portuguese | MIT | exact (76/76) | 1.000000 |
 | `bge-m3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) | 568M | 1024 | 100+ | MIT | exact (76/76) | 1.000000 |
 
 Measured on PostgreSQL 17 + plv8 3.2.4 with the full test suite (`pytest
@@ -43,8 +46,16 @@ tests/`): exact token-id match on every reference text, end-to-end cosine
 against sentence-transformers output (worst case 0.999999), and the
 adversarial Unicode edge cases. Reproduce with `pg-transformers verify <key>`.
 
-Each model also has a weight-only int8 variant (`all-minilm-int8`,
-`serafim-100m-int8`, `bge-m3-int8`): linear weights and the word table are
+The two Serafim models are PORTULAN's sentence-encoder fine-tunes of
+BERTimbau base and large (same weights lineage and vocabulary), so this is
+BERTimbau in the form that produces useful sentence embeddings. Note that
+`multilingual-e5-small` was trained with input prefixes: prepend
+`"query: "` to search queries and `"passage: "` to documents (or
+`"query: "` to both for symmetric similarity); embedding bare text degrades
+its ranking quality.
+
+Each model also has a weight-only int8 variant (same key plus `-int8`,
+e.g. `serafim-335m-int8`): linear weights and the word table are
 stored as int8 with one f32 scale per row. The kernel quantizes activations
 per token (block-wise; exact u8 on the baseline kernel, u7 on the relaxed
 one, which is what lets it use a single relaxed dot per 16 columns) and

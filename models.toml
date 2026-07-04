@@ -48,6 +48,54 @@ ln_eps = 1e-12
 pooling = "mean"
 tokenizer = "wordpiece"
 
+[serafim-335m]
+hf_id = "PORTULAN/serafim-335m-portuguese-pt-sentence-encoder-ir"
+license = "MIT"
+params = "335M"
+languages = "Portuguese"
+vocab_size = 29794
+hidden = 1024
+layers = 24
+intermediate = 4096
+heads = 16
+max_tokens = 512
+pos_offset = 0
+ln_eps = 1e-12
+pooling = "mean"
+tokenizer = "wordpiece"
+
+[multilingual-minilm]
+hf_id = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+license = "Apache-2.0"
+params = "118M"
+languages = "multilingual (50+)"
+vocab_size = 250037
+hidden = 384
+layers = 12
+intermediate = 1536
+heads = 12
+max_tokens = 128
+pos_offset = 0
+ln_eps = 1e-12
+pooling = "mean"
+tokenizer = "spm"
+
+[multilingual-e5-small]
+hf_id = "intfloat/multilingual-e5-small"
+license = "MIT"
+params = "118M"
+languages = "multilingual (94)"
+vocab_size = 250037
+hidden = 384
+layers = 12
+intermediate = 1536
+heads = 12
+max_tokens = 512
+pos_offset = 0
+ln_eps = 1e-12
+pooling = "mean"
+tokenizer = "spm"
+
 [bge-m3]
 hf_id = "BAAI/bge-m3"
 license = "MIT"
@@ -71,6 +119,21 @@ min_cosine = 0.995
 
 [serafim-100m-int8]
 base = "serafim-100m"
+quant = "int8"
+min_cosine = 0.995
+
+[serafim-335m-int8]
+base = "serafim-335m"
+quant = "int8"
+min_cosine = 0.995
+
+[multilingual-minilm-int8]
+base = "multilingual-minilm"
+quant = "int8"
+min_cosine = 0.995
+
+[multilingual-e5-small-int8]
+base = "multilingual-e5-small"
 quant = "int8"
 min_cosine = 0.995
 

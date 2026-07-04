@@ -157,7 +157,13 @@ def _export_vocab(key, m, tok, out_dir, meta):
     from .maps import fold_map, nfkc_map
     if m["tokenizer"] == "spm":
         import sentencepiece as spm
-        sp = spm.SentencePieceProcessor(model_file=tok.vocab_file)
+        # transformers >= 5 tokenizers don't expose vocab_file; fetch the
+        # sentencepiece model straight from the hub in that case
+        vf = getattr(tok, "vocab_file", None)
+        if not vf or not os.path.exists(vf):
+            from huggingface_hub import hf_hub_download
+            vf = hf_hub_download(m["hf_id"], "sentencepiece.bpe.model")
+        sp = spm.SentencePieceProcessor(model_file=vf)
         score, piece_id = {}, {}
         mn = 1e18
         for i in range(sp.get_piece_size()):
