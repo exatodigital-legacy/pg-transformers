@@ -1,13 +1,16 @@
 # Self-hosted PostgreSQL
 
-Verified with all three models on PostgreSQL 17 + plv8 3.2.4 (arm64 and
+Verified with all six models on PostgreSQL 17 + plv8 3.2.4 (arm64 and
 x86_64 containers).
 
 - `docker compose -f docker/compose.yml up -d` starts PostgreSQL 17 + plv8
   on port 5432, pulling the prebuilt multi-arch image from
   `ghcr.io/exatodigital-legacy/postgres-plv8` (amd64 + arm64). To compile
   plv8 from source instead, add the override: `docker compose -f
-  docker/compose.yml -f docker/compose.build.yml up -d --build`.
+  docker/compose.yml -f docker/compose.build.yml up -d --build`. The
+  `16-3.1.10` tag of the same image reproduces the plv8 3.1.x (V8 9.7)
+  environment of AWS RDS/Aurora on PostgreSQL 14-17, built from
+  `docker/Dockerfile.plv31`.
 - For an existing server, install plv8 3.1+ from your distro packages or from
   source (https://github.com/plv8/plv8), then run `sql/probe.sql`.
 - Memory: the per-session model weights live in the backend process, not

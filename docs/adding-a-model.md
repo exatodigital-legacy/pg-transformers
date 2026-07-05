@@ -69,7 +69,8 @@ variants the fastest ones. The port is no longer bit-exact, so `verify`
 checks cosine against the fp32 PyTorch ground truth using `min_cosine`
 instead of the 0.999 exact-port default; state the measured worst-case
 cosine in your PR. Export reuses the base model's tokenizer and reference
-artifacts when they are present.
+artifacts when they are present. The kernel mechanics behind all of this
+are in [kernel-notes.md](kernel-notes.md).
 
 ## Sizing
 
