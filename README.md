@@ -164,6 +164,12 @@ the flavor `pgt_load` auto-picks; "PG 14-17" is a real plv8 3.1.10 (V8 9.7):
 | `all-minilm-int8` | 2112 · 8 ms | 875 · 23 ms | 1377 · 13 ms | 1357 · 13 ms |
 | `serafim-100m` | 159 · 134 ms | 138 · 152 ms | 150 · 152 ms | 127 · 167 ms |
 | `serafim-100m-int8` | 314 · 48 ms | 117 · 152 ms | 196 · 82 ms | 194 · 83 ms |
+| `multilingual-minilm` | 711 · 29 ms | 601 · 33 ms | 634 · 33 ms | 531 · 37 ms |
+| `multilingual-minilm-int8` | 1263 · 14 ms | 473 · 40 ms | 761 · 23 ms | 748 · 23 ms |
+| `multilingual-e5-small` | 549 · 29 ms | 467 · 33 ms | 490 · 33 ms | 416 · 38 ms |
+| `multilingual-e5-small-int8` | 795 · 14 ms | 377 · 40 ms | 541 · 23 ms | 526 · 23 ms |
+| `serafim-335m` | 42 · 480 ms | 36 · 539 ms | 40 · 528 ms | 34 · 583 ms |
+| `serafim-335m-int8` | 96 · 170 ms | 35 · 525 ms | 55 · 293 ms | 55 · 294 ms |
 | `bge-m3` | 43 · 448 ms | 38 · 502 ms | 41 · 506 ms | 34 · 555 ms |
 | `bge-m3-int8` | 97 · 164 ms | 35 · 496 ms | 56 · 274 ms | 56 · 274 ms |
 
